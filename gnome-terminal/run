@@ -1,0 +1,29 @@
+#!/usr/bin/env bash
+set -euxo pipefail
+
+rm -rf dist
+mkdir dist
+
+PKG=gnome-terminal
+DSC=https://launchpad.net/ubuntu/+archive/primary/+sourcefiles/gnome-terminal/3.38.0-1ubuntu1/gnome-terminal_3.38.0-1ubuntu1.dsc
+BUILD='dpkg-buildpackage -us -uc -sa'
+BUILD='debuild -S'
+
+docker build -t "focal-${PKG}-build" .
+
+docker run --rm -ti \
+    -v "$HOME/.gnupg/pubring.gpg:/root/.gnupg/pubring.gpg:ro" \
+    -v "$HOME/.gnupg/secring.gpg:/root/.gnupg/secring.gpg:ro" \
+    -v "$PWD:/src:ro" \
+    -v "$PWD/dist:/dist:rw" \
+    "focal-${PKG}-build" bash -euxc "\
+    cd /tmp && \
+    dget -ux $DSC && \
+    cd $PKG*/ && \
+    cp /src/re-enable-tab-tearing.patch debian/patches && \
+    echo re-enable-tab-tearing.patch >> debian/patches/series && \
+    DEBFULLNAME='Anthony Sottile' DEBEMAIL=asottile@umich.edu \
+        dch --local +asottile --distribution focal 'rebuild for focal' && \
+    $BUILD && \
+    find .. -maxdepth 1 -type f | xargs --replace cp {} /dist/
+"
