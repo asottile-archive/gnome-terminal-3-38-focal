@@ -1,0 +1,28 @@
+#!/usr/bin/env bash
+set -euxo pipefail
+
+rm -rf dist
+mkdir dist
+
+PKG=docbook-xsl
+DSC=http://archive.ubuntu.com/ubuntu/pool/universe/d/docbook-xsl/docbook-xsl_1.79.2+dfsg-1.dsc
+BUILD='dpkg-buildpackage -us -uc -sa'
+BUILD='debuild -S'
+
+docker build -t "focal-${PKG}-build" .
+
+docker run --rm -ti \
+    -v "$HOME/.gnupg/pubring.gpg:/root/.gnupg/pubring.gpg:ro" \
+    -v "$HOME/.gnupg/secring.gpg:/root/.gnupg/secring.gpg:ro" \
+    -v "$PWD:/src:ro" \
+    -v "$PWD/dist:/dist:rw" \
+    "focal-${PKG}-build" bash -euxc "\
+    cd /tmp && \
+    dget -ux $DSC && \
+    cd $PKG*/ && \
+    DEBFULLNAME='Anthony Sottile' DEBEMAIL=asottile@umich.edu \
+        dch --local +asottile --distribution focal 'rebuild for focal' && \
+    sed -i 's/debhelper-compat (= 13)/debhelper-compat (= 12)/g' debian/control && \
+    $BUILD && \
+    find .. -maxdepth 1 -type f | xargs --replace cp {} /dist/
+"
