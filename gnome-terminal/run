@@ -24,6 +24,8 @@ docker run --rm -ti \
     echo re-enable-tab-tearing.patch >> debian/patches/series && \
     DEBFULLNAME='Anthony Sottile' DEBEMAIL=asottile@umich.edu \
         dch --local +asottile --distribution focal 'rebuild for focal' && \
+    DEBFULLNAME='Anthony Sottile' DEBEMAIL=asottile@umich.edu \
+        dch --local +asottile --distribution focal 'rebuild against newer vte' && \
     $BUILD && \
     find .. -maxdepth 1 -type f | xargs --replace cp {} /dist/
 "
