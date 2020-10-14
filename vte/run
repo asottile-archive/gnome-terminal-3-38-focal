@@ -20,8 +20,13 @@ docker run --rm -ti \
     cd /tmp && \
     dget -ux $DSC && \
     cd $PKG*/ && \
+    cp /src/*.patch debian/patches/ && \
+    echo un-revert-sixel.patch >> debian/patches/series && \
+    sed -i 's/\tdh_auto_test/\t#dh_auto_test/;s/-Ddocs=true/-Ddocs=true -Dsixel=true/' debian/rules && \
     DEBFULLNAME='Anthony Sottile' DEBEMAIL=asottile@umich.edu \
         dch --local +asottile --distribution focal 'rebuild for focal' && \
+    DEBFULLNAME='Anthony Sottile' DEBEMAIL=asottile@umich.edu \
+        dch --local +asottile --distribution focal 'un-revert sixel patch' && \
     $BUILD && \
     find .. -maxdepth 1 -type f | xargs --replace cp {} /dist/
 "

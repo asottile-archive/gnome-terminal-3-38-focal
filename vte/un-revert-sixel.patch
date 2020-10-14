@@ -1,0 +1,2858 @@
+From: Anthony Sottile <asottile@umich.edu>
+Date: Tue, 13 Oct 2020 20:24:18 -0700
+Subject: un-revert-sixel
+
+---
+ doc/reference/vte-sections.txt |   2 +
+ meson.build                    |   2 +
+ meson_options.txt              |   7 +
+ src/app/app.cc                 |   6 +
+ src/debug.h                    |   1 +
+ src/image.cc                   |  68 ++++
+ src/image.hh                   | 102 ++++++
+ src/meson.build                |  25 ++
+ src/parser-cmd.hh              |   2 +-
+ src/parser-dcs.hh              |   2 +-
+ src/parser-string.hh           |  10 +
+ src/pty.cc                     |   4 +
+ src/ring.cc                    | 223 +++++++++++-
+ src/ring.hh                    |  28 ++
+ src/sixel-test.cc              | 763 +++++++++++++++++++++++++++++++++++++++++
+ src/sixelparser.cc             | 713 ++++++++++++++++++++++++++++++++++++++
+ src/sixelparser.hh             |  75 ++++
+ src/vte.cc                     |  88 ++++-
+ src/vtedefines.hh              |   2 +
+ src/vtegtk.cc                  |  28 +-
+ src/vteinternal.hh             |  21 +-
+ src/vteseq.cc                  | 114 +++++-
+ src/widget.hh                  |   3 +
+ 23 files changed, 2263 insertions(+), 26 deletions(-)
+ create mode 100644 src/image.cc
+ create mode 100644 src/image.hh
+ create mode 100644 src/sixel-test.cc
+ create mode 100644 src/sixelparser.cc
+ create mode 100644 src/sixelparser.hh
+
+diff --git a/doc/reference/vte-sections.txt b/doc/reference/vte-sections.txt
+index c222e7f..28c1c95 100644
+--- a/doc/reference/vte-sections.txt
++++ b/doc/reference/vte-sections.txt
+@@ -82,6 +82,8 @@ vte_terminal_set_word_char_exceptions
+ vte_terminal_get_word_char_exceptions
+ vte_terminal_set_input_enabled
+ vte_terminal_get_input_enabled
++vte_terminal_get_sixel_enabled
++vte_terminal_set_sixel_enabled
+ vte_terminal_write_contents_sync
+ vte_terminal_search_find_next
+ vte_terminal_search_find_previous
+diff --git a/meson.build b/meson.build
+index 8a1a81c..5aac662 100644
+--- a/meson.build
++++ b/meson.build
+@@ -124,6 +124,7 @@ config_h.set('WITH_A11Y', get_option('a11y'))
+ config_h.set('WITH_FRIBIDI', get_option('fribidi'))
+ config_h.set('WITH_GNUTLS', get_option('gnutls'))
+ config_h.set('WITH_ICU', get_option('icu'))
++config_h.set('WITH_SIXEL', get_option('sixel'))
+ 
+ ver = glib_min_req_version.split('.')
+ config_h.set('GLIB_VERSION_MIN_REQUIRED', '(G_ENCODE_VERSION(' + ver[0] + ',' + ver[1] + '))')
+@@ -505,6 +506,7 @@ output += '  GTK+ 4.0:     ' + get_option('gtk4').to_string() + '\n'
+ output += '  ICU:          ' + get_option('icu').to_string() + '\n'
+ output += '  GIR:          ' + get_option('gir').to_string() + '\n'
+ output += '  systemd:      ' + systemd_dep.found().to_string() + '\n'
++output += '  SIXEL:        ' + get_option('sixel').to_string() + '\n'
+ output += '  Vala:         ' + get_option('vapi').to_string() + '\n'
+ output += '\n'
+ output += '  Prefix:       ' + get_option('prefix') + '\n'
+diff --git a/meson_options.txt b/meson_options.txt
+index f8143f7..d37be0a 100644
+--- a/meson_options.txt
++++ b/meson_options.txt
+@@ -85,6 +85,13 @@ option(
+   description: 'Enable legacy charset support using ICU',
+ )
+ 
++option(
++  'sixel',
++  type: 'boolean',
++  value: false,
++  description: 'Enable SIXEL support',
++)
++
+ option(
+   '_systemd',
+   type: 'boolean',
+diff --git a/src/app/app.cc b/src/app/app.cc
+index d8bfe9e..a615fd5 100644
+--- a/src/app/app.cc
++++ b/src/app/app.cc
+@@ -69,6 +69,7 @@ public:
+         gboolean no_scrollbar{false};
+         gboolean no_shaping{false};
+         gboolean no_shell{false};
++        gboolean no_sixel{false};
+         gboolean no_systemd_scope{false};
+         gboolean object_notifications{false};
+         gboolean require_systemd_scope{false};
+@@ -559,6 +560,8 @@ public:
+                           "Disable Arabic shaping", nullptr },
+                         { "no-shell", 'S', 0, G_OPTION_ARG_NONE, &no_shell,
+                           "Disable spawning a shell inside the terminal", nullptr },
++                        { "no-sixel", 0, 0, G_OPTION_ARG_NONE, &no_sixel,
++                          "Disable SIXEL images", nullptr },
+                         { "no-systemd-scope", 0, 0, G_OPTION_ARG_NONE, &no_systemd_scope,
+                           "Don't use systemd user scope", nullptr },
+                         { "object-notifications", 'N', 0, G_OPTION_ARG_NONE, &object_notifications,
+@@ -571,6 +574,8 @@ public:
+                           "Require use of a systemd user scope", nullptr },
+                         { "scrollback-lines", 'n', 0, G_OPTION_ARG_INT, &scrollback_lines,
+                           "Specify the number of scrollback-lines (-1 for infinite)", nullptr },
++                        { "sixel", 0, G_OPTION_FLAG_REVERSE, G_OPTION_ARG_NONE, &no_sixel,
++                          "Enable SIXEL images", nullptr },
+                         { "transparent", 'T', 0, G_OPTION_ARG_INT, &transparency_percent,
+                           "Enable the use of a transparent background", "0..100" },
+                         { "verbose", 'v', G_OPTION_FLAG_NO_ARG, G_OPTION_ARG_CALLBACK,
+@@ -2113,6 +2118,7 @@ vteapp_window_constructed(GObject *object)
+         vte_terminal_set_cursor_shape(window->terminal, options.cursor_shape);
+         vte_terminal_set_enable_bidi(window->terminal, !options.no_bidi);
+         vte_terminal_set_enable_shaping(window->terminal, !options.no_shaping);
++        vte_terminal_set_enable_sixel(window->terminal, !options.no_sixel);
+         vte_terminal_set_mouse_autohide(window->terminal, true);
+         vte_terminal_set_rewrap_on_resize(window->terminal, !options.no_rewrap);
+         vte_terminal_set_scroll_on_output(window->terminal, false);
+diff --git a/src/debug.h b/src/debug.h
+index 90be5c5..a9970f5 100644
+--- a/src/debug.h
++++ b/src/debug.h
+@@ -68,6 +68,7 @@ typedef enum {
+         VTE_DEBUG_BIDI          = 1 << 28,
+         VTE_DEBUG_CONVERSION    = 1 << 29,
+         VTE_DEBUG_EXCEPTIONS    = 1 << 30,
++        VTE_DEBUG_IMAGE         = 1 << 31,
+ } VteDebugFlags;
+ 
+ void _vte_debug_init(void);
+diff --git a/src/image.cc b/src/image.cc
+new file mode 100644
+index 0000000..4ff0116
+--- /dev/null
++++ b/src/image.cc
+@@ -0,0 +1,68 @@
++/*
++ * Copyright © 2016-2020 Hayaki Saito <saitoha@me.com>
++ * Copyright © 2020 Hans Petter Jansson <hpj@cl.no>
++ *
++ * This library is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 3 of the License, or (at your option) any later version.
++ *
++ * This library is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public License
++ * along with this program.  If not, see <https://www.gnu.org/licenses/>.
++ */
++
++#include "config.h"
++
++#include <glib.h>
++#include <stdio.h>
++#include "vteinternal.hh"
++
++#include "image.hh"
++
++namespace vte {
++
++namespace image {
++
++/* Paint the image with provided cairo context */
++void
++Image::paint(cairo_t* cr,
++             int offset_x,
++             int offset_y,
++             int cell_width,
++             int cell_height) const noexcept
++{
++        auto scale_x = 1.0;
++        auto scale_y = 1.0;
++
++        auto real_offset_x = double(offset_x);
++        auto real_offset_y = double(offset_y);
++
++        if (cell_width != m_cell_width || cell_height != m_cell_height) {
++                scale_x = cell_width / (double) m_cell_width;
++                scale_y = cell_height / (double) m_cell_height;
++
++                real_offset_x /= scale_x;
++                real_offset_y /= scale_y;
++        }
++
++        cairo_save(cr);
++        cairo_set_operator(cr, CAIRO_OPERATOR_OVER);
++
++        if (!(_vte_double_equal (scale_x, 1.0) && _vte_double_equal (scale_y, 1.0)))
++                cairo_scale (cr, scale_x, scale_y);
++
++        cairo_rectangle(cr, real_offset_x, real_offset_y, m_width_pixels, m_height_pixels);
++        cairo_clip(cr);
++        cairo_set_source_surface(cr, m_surface.get(), real_offset_x, real_offset_y);
++        cairo_paint(cr);
++        cairo_restore(cr);
++}
++
++} // namespace image
++
++} // namespace vte
+diff --git a/src/image.hh b/src/image.hh
+new file mode 100644
+index 0000000..fa972c9
+--- /dev/null
++++ b/src/image.hh
+@@ -0,0 +1,102 @@
++/*
++ * Copyright © 2016-2020 Hayaki Saito <saitoha@me.com>
++ * Copyright © 2020 Hans Petter Jansson <hpj@cl.no>
++ *
++ * This library is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 3 of the License, or (at your option) any later version.
++ *
++ * This library is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public License
++ * along with this program.  If not, see <https://www.gnu.org/licenses/>.
++ */
++
++#pragma once
++
++#include <pango/pangocairo.h>
++#include "cairo-glue.hh"
++
++namespace vte {
++
++namespace image {
++
++class Image {
++private:
++        // Device-friendly Cairo surface
++        vte::cairo::Surface m_surface{};
++
++        // Draw/prune priority, must be unique
++        int m_priority;
++
++        // Image dimensions in pixels
++        int m_width_pixels;
++        int m_height_pixels;
++
++        // Top left corner offset in cell units
++        int m_left_cells;
++        int m_top_cells;
++
++        // Cell dimensions in pixels at time of image creation
++        int m_cell_width;
++        int m_cell_height;
++
++public:
++        Image(vte::cairo::Surface&& surface,
++              int priority,
++              int width_pixels,
++              int height_pixels,
++              int col,
++              int row,
++              int cell_width,
++              int cell_height) noexcept
++                : m_surface{std::move(surface)},
++                  m_priority{priority},
++                  m_width_pixels{width_pixels},
++                  m_height_pixels{height_pixels},
++                  m_left_cells{col},
++                  m_top_cells{row},
++                  m_cell_width{cell_width},
++                  m_cell_height{cell_height}
++        {
++        }
++
++        ~Image() = default;
++
++        Image(Image const&) = delete;
++        Image(Image&&) = delete;
++        Image operator=(Image const&) = delete;
++        Image operator=(Image&&) = delete;
++
++        inline constexpr auto get_priority() const noexcept { return m_priority; }
++        inline constexpr auto get_left() const noexcept { return m_left_cells; }
++        inline auto get_top() const noexcept { return m_top_cells; }
++        inline void set_top(int row) noexcept { m_top_cells = row; }
++        inline constexpr auto get_width() const noexcept { return (m_width_pixels + m_cell_width - 1) / m_cell_width; }
++        inline constexpr auto get_height() const noexcept { return (m_height_pixels + m_cell_height - 1) / m_cell_height; }
++        inline auto get_bottom() const noexcept { return m_top_cells + get_height() - 1; }
++
++        inline auto resource_size() const noexcept
++        {
++                if (cairo_image_surface_get_stride(m_surface.get()) != 0)
++                        return cairo_image_surface_get_stride(m_surface.get()) * m_height_pixels;
++
++                /* Not an image surface: Only the device knows for sure, so we guess */
++                return m_width_pixels * m_height_pixels * 4;
++        }
++
++        void paint(cairo_t* cr,
++                   int offset_x,
++                   int offset_y,
++                   int cell_width,
++                   int cell_height) const noexcept;
++
++}; // class Image
++
++} // namespace image
++
++} // namespace vte
+diff --git a/src/meson.build b/src/meson.build
+index 087831f..365cf48 100644
+--- a/src/meson.build
++++ b/src/meson.build
+@@ -87,6 +87,13 @@ regex_sources = files(
+   'regex.hh'
+ )
+ 
++sixel_sources = files(
++  'image.cc',
++  'image.hh',
++  'sixelparser.cc',
++  'sixelparser.hh',
++)
++
+ systemd_sources = files(
+   'systemd.cc',
+   'systemd.hh',
+@@ -165,6 +172,10 @@ if get_option('icu')
+   libvte_common_sources += icu_sources
+ endif
+ 
++if get_option('sixel')
++  libvte_common_sources += sixel_sources
++endif
++
+ if systemd_dep.found()
+   libvte_common_sources += systemd_sources
+ endif
+@@ -459,6 +470,20 @@ test_refptr = executable(
+   install: false,
+ )
+ 
++if get_option('sixel')
++  test_sixel_sources = files(
++    'sixel-test.cc',
++  )
++
++  test_sixel = executable(
++    'test-sixel',
++    sources: test_sixel_sources,
++    dependencies: [glib_dep,],
++    include_directories: top_inc,
++    install: false,
++  )
++endif
++
+ test_tabstops_sources = files(
+   'tabstops-test.cc',
+   'tabstops.hh'
+diff --git a/src/parser-cmd.hh b/src/parser-cmd.hh
+index f8481dd..a94b9d6 100644
+--- a/src/parser-cmd.hh
++++ b/src/parser-cmd.hh
+@@ -62,6 +62,7 @@ _VTE_CMD(DECSCUSR) /* set cursor style */
+ _VTE_CMD(DECSED) /* selective erase in display */
+ _VTE_CMD(DECSEL) /* selective erase in line */
+ _VTE_CMD(DECSGR) /* DEC select graphics rendition */
++_VTE_CMD(DECSIXEL) /* SIXEL graphics */
+ _VTE_CMD(DECSLPP) /* set lines per page */
+ _VTE_CMD(DECSLRM_OR_SCOSC) /* set left and right margins or SCO save cursor */
+ _VTE_CMD(DECSR) /* secure reset */
+@@ -201,7 +202,6 @@ _VTE_NOP(DECSDPT) /* select digital printed data type */
+ _VTE_NOP(DECSERA) /* selective erase rectangular area */
+ _VTE_NOP(DECSEST) /* energy saver time */
+ _VTE_NOP(DECSFC) /* select flow control */
+-_VTE_NOP(DECSIXEL) /* SIXEL graphics */
+ _VTE_NOP(DECSKCV) /* set key click volume */
+ _VTE_NOP(DECSLCK) /* set lock key style */
+ _VTE_NOP(DECSLE) /* select locator events */
+diff --git a/src/parser-dcs.hh b/src/parser-dcs.hh
+index 6ce2e74..b2b0b24 100644
+--- a/src/parser-dcs.hh
++++ b/src/parser-dcs.hh
+@@ -24,7 +24,7 @@ _VTE_NOQ(RLOGIN_MML,             DCS,    'm',  NONE,  1, HASH     ) /* RLogin mu
+ _VTE_NOQ(DECREGIS,               DCS,    'p',  NONE,  0, NONE     ) /* ReGIS-graphics */
+ _VTE_NOQ(DECRSTS,                DCS,    'p',  NONE,  1, CASH     ) /* restore-terminal-state */
+ _VTE_NOQ(XTERM_STCAP,            DCS,    'p',  NONE,  1, PLUS     ) /* xterm set termcap/terminfo */
+-_VTE_NOQ(DECSIXEL,               DCS,    'q',  NONE,  0, NONE     ) /* SIXEL-graphics */
++_VTE_SEQ(DECSIXEL,               DCS,    'q',  NONE,  0, NONE     ) /* SIXEL-graphics */
+ _VTE_SEQ(DECRQSS,                DCS,    'q',  NONE,  1, CASH     ) /* request-selection-or-setting */
+ _VTE_NOQ(XTERM_RQTCAP,           DCS,    'q',  NONE,  1, PLUS     ) /* xterm request termcap/terminfo */
+ _VTE_NOQ(DECLBAN,                DCS,    'r',  NONE,  0, NONE     ) /* load-banner-message */
+diff --git a/src/parser-string.hh b/src/parser-string.hh
+index 7de37e4..746051e 100644
+--- a/src/parser-string.hh
++++ b/src/parser-string.hh
+@@ -34,7 +34,17 @@ typedef struct vte_seq_string_t {
+ } vte_seq_string_t;
+ 
+ #define VTE_SEQ_STRING_DEFAULT_CAPACITY (1 << 7) /* must be power of two */
++
++#ifdef WITH_SIXEL
++/* This needs to be somewhat large for the time being; it accommodates inline
++ * graphics formats (e.g. sixels), and there is no provision for parsing
++ * those incrementally yet. 8M characters is typically enough for an
++ * RLE-incompressible 256-color 1920x1080 image. Since VTE seqs store 32 bits
++ * per character, this corresponds to a 32MiB buffer. */
++#define VTE_SEQ_STRING_MAX_CAPACITY     (1 << 23)
++#else
+ #define VTE_SEQ_STRING_MAX_CAPACITY     (1 << 12)
++#endif
+ 
+ /*
+  * vte_seq_string_init:
+diff --git a/src/pty.cc b/src/pty.cc
+index e389758..ce77106 100644
+--- a/src/pty.cc
++++ b/src/pty.cc
+@@ -294,6 +294,10 @@ Pty::set_size(int rows,
+ 	memset(&size, 0, sizeof(size));
+ 	size.ws_row = rows > 0 ? rows : 24;
+ 	size.ws_col = columns > 0 ? columns : 80;
++#ifdef WITH_SIXEL
++        size.ws_ypixel = size.ws_row * cell_height_px;
++        size.ws_xpixel = size.ws_col * cell_width_px;
++#endif
+ 	_vte_debug_print(VTE_DEBUG_PTY,
+ 			"Setting size on fd %d to (%d,%d).\n",
+ 			master, columns, rows);
+diff --git a/src/ring.cc b/src/ring.cc
+index 2d76d13..ae86d23 100644
+--- a/src/ring.cc
++++ b/src/ring.cc
+@@ -26,6 +26,20 @@
+ 
+ #include <string.h>
+ 
++#ifdef WITH_SIXEL
++
++#include <new>
++
++/* We should be able to hold a single fullscreen 4K image at most.
++ * 35MiB equals 3840 * 2160 * 4 plus a little extra. */
++#define IMAGE_FAST_MEMORY_USED_MAX (35 * 1024 * 1024)
++
++/* Hard limit on number of images to keep around. This limits the impact
++ * of potential issues related to algorithmic complexity. */
++#define IMAGE_FAST_COUNT_MAX 4096
++
++#endif /* WITH_SIXEL */
++
+ /*
+  * Copy the common attributes from VteCellAttr to VteStreamCellAttr or vice versa.
+  */
+@@ -37,6 +51,10 @@ _attrcpy (void *dst, void *src)
+ 
+ using namespace vte::base;
+ 
++#ifdef WITH_SIXEL
++using namespace vte::image;
++#endif
++
+ /*
+  * VteRing: A buffer ring
+  */
+@@ -86,6 +104,13 @@ Ring::Ring(row_t max_rows,
+         auto empty_str = g_string_new_len("", 0);
+         g_ptr_array_add(m_hyperlinks, empty_str);
+ 
++#ifdef WITH_SIXEL
++        m_image_by_top_map = new (std::nothrow) std::map<int, Image *>();
++        m_image_priority_map = new (std::nothrow) std::map<int, Image *>();
++        m_next_image_priority = 0;
++        m_image_fast_memory_used = 0;
++#endif
++
+ 	validate();
+ }
+ 
+@@ -96,6 +121,17 @@ Ring::~Ring()
+ 
+ 	g_free (m_array);
+ 
++#ifdef WITH_SIXEL
++        /* Clear images */
++	auto image_map = m_image_by_top_map;
++
++        for (auto it = image_map->begin (); it != image_map->end (); ++it)
++                delete it->second;
++        image_map->clear();
++        delete m_image_by_top_map;
++        delete m_image_priority_map;
++#endif /* WITH_SIXEL */
++
+ 	if (m_has_streams) {
+ 		g_object_unref (m_attr_stream);
+ 		g_object_unref (m_text_stream);
+@@ -191,6 +227,107 @@ Ring::hyperlink_maybe_gc(row_t increment)
+                 hyperlink_gc();
+ }
+ 
++#ifdef WITH_SIXEL
++
++void
++Ring::image_gc_region()
++{
++        cairo_region_t *region = cairo_region_create();
++
++        for (auto it = m_image_priority_map->rbegin(); it != m_image_priority_map->rend(); ) {
++                Image *image = it->second;
++                cairo_rectangle_int_t r;
++
++                r.x = image->get_left();
++                r.y = image->get_top();
++                r.width = image->get_width();
++                r.height = image->get_height();
++
++                if (cairo_region_contains_rectangle(region, &r) == CAIRO_REGION_OVERLAP_IN) {
++                        /* Image has been completely overdrawn; delete it */
++
++                        m_image_fast_memory_used -= image->resource_size();
++
++                        /* Apparently this is the cleanest way to erase() with a reverse iterator... */
++                        it = decltype(it){m_image_priority_map->erase(std::next(it).base())};
++                        unlink_image_from_top_map(image);
++                        delete image;
++                        continue;
++                }
++
++                cairo_region_union_rectangle(region, &r);
++                it++;
++        }
++
++        cairo_region_destroy(region);
++}
++
++void
++Ring::image_gc()
++{
++        while (m_image_fast_memory_used > IMAGE_FAST_MEMORY_USED_MAX
++               || m_image_priority_map->size() > IMAGE_FAST_COUNT_MAX) {
++                if (m_image_priority_map->empty()) {
++                        /* If this happens, we've miscounted somehow. */
++                        break;
++                }
++
++                Image *image = m_image_priority_map->begin()->second;
++                m_image_fast_memory_used -= image->resource_size();
++                m_image_priority_map->erase(m_image_priority_map->begin());
++                unlink_image_from_top_map(image);
++                delete image;
++        }
++}
++
++void
++Ring::unlink_image_from_top_map(Image *image)
++{
++        for (auto it = m_image_by_top_map->find(image->get_top()); it != m_image_by_top_map->end(); it++) {
++                Image *cur_image = it->second;
++
++                if (cur_image->get_priority() == image->get_priority()) {
++                        m_image_by_top_map->erase(it);
++                        break;
++                }
++        }
++}
++
++void
++Ring::rebuild_image_top_map()
++{
++        m_image_by_top_map->clear();
++
++        for (auto it = m_image_priority_map->begin(); it != m_image_priority_map->end(); it++) {
++                Image *image = it->second;
++                m_image_by_top_map->insert(std::make_pair(image->get_top(), image));
++        }
++}
++
++bool
++Ring::rewrap_images_in_range(std::map<int,Image*>::iterator &it,
++                             size_t text_start_ofs, size_t text_end_ofs, row_t new_row_index)
++{
++        for ( ; it != m_image_by_top_map->end(); it++) {
++                Image *image = it->second;
++                CellTextOffset ofs;
++
++                if (!frozen_row_column_to_text_offset(image->get_top(), 0, &ofs))
++                        return false;
++
++                if (ofs.text_offset >= text_end_ofs)
++                        break;
++
++                if (ofs.text_offset >= text_start_ofs && ofs.text_offset < text_end_ofs) {
++                        image->set_top(new_row_index);
++                }
++        }
++
++        return true;
++}
++
++#endif /* WITH_SIXEL */
++
+ /*
+  * Find existing idx for the hyperlink or allocate a new one.
+  *
+@@ -585,12 +722,26 @@ Ring::reset_streams(row_t position)
+ Ring::row_t
+ Ring::reset()
+ {
++#ifdef WITH_SIXEL
++        auto image_map = m_image_by_top_map;
++#endif
++
+         _vte_debug_print (VTE_DEBUG_RING, "Reseting the ring at %lu.\n", m_end);
+ 
+         reset_streams(m_end);
+         m_start = m_writable = m_end;
+         m_cached_row_num = (row_t)-1;
+ 
++#ifdef WITH_SIXEL
++        /* Clear images */
++        for (auto it = image_map->begin (); it != image_map->end (); ++it)
++                delete it->second;
++        image_map->clear();
++        m_image_priority_map->clear();
++        m_next_image_priority = 0;
++        m_image_fast_memory_used = 0;
++#endif
++
+         return m_end;
+ }
+ 
+@@ -1021,7 +1172,16 @@ Ring::frozen_row_column_to_text_offset(row_t position,
+ 	} else
+ 		records[1].text_start_offset = _vte_stream_head(m_text_stream);
+ 
+-	g_string_set_size (buffer, records[1].text_start_offset - records[0].text_start_offset);
++	offset->fragment_cells = 0;
++	offset->eol_cells = -1;
++	offset->text_offset = records[0].text_start_offset;
++
++        /* Save some work if we're in column 0. This holds true for images, whose column
++         * positions are disregarded for the purposes of wrapping. */
++        if (column == 0)
++                return true;
++
++        g_string_set_size (buffer, records[1].text_start_offset - records[0].text_start_offset);
+ 	if (!_vte_stream_read(m_text_stream, records[0].text_start_offset, buffer->str, buffer->len))
+ 		return false;
+ 
+@@ -1033,8 +1193,6 @@ Ring::frozen_row_column_to_text_offset(row_t position,
+ 	/* row and buffer now contain the same text, in different representation */
+ 
+ 	/* count the number of characters up to the given column */
+-	offset->fragment_cells = 0;
+-	offset->eol_cells = -1;
+ 	num_chars = 0;
+ 	for (i = 0, cell = row->cells; i < row->len && i < column; i++, cell++) {
+ 		if (G_LIKELY (!cell->attr.fragment())) {
+@@ -1055,7 +1213,7 @@ Ring::frozen_row_column_to_text_offset(row_t position,
+ 		off++;
+ 		if ((buffer->str[off] & 0xC0) != 0x80) num_chars--;
+ 	}
+-	offset->text_offset = records[0].text_start_offset + off;
++	offset->text_offset += off;
+ 	return true;
+ }
+ 
+@@ -1167,6 +1325,9 @@ Ring::rewrap(column_t columns,
+ 	gsize paragraph_len;  /* excluding trailing '\n' */
+ 	gsize attr_offset;
+ 	gsize old_ring_end;
++#ifdef WITH_SIXEL
++	auto image_it = m_image_by_top_map->begin();
++#endif
+ 
+ 	if (G_UNLIKELY(length() == 0))
+ 		return;
+@@ -1301,10 +1462,17 @@ Ring::rewrap(column_t columns,
+ 										"      Marker #%d will be here in row %lu\n", i, new_row_index);
+ 							}
+ 						}
++
++#ifdef WITH_SIXEL
++						if (!rewrap_images_in_range(image_it, new_record.text_start_offset, text_offset, new_row_index))
++							goto err;
++#endif
++
+ 						new_row_index++;
+ 						new_record.text_start_offset = text_offset;
+ 						new_record.attr_start_offset = attr_offset;
+ 						col = 0;
++
+ 					}
+ 					if (paragraph_is_ascii) {
+ 						/* Shortcut for quickly wrapping ASCII (excluding TAB) text.
+@@ -1348,6 +1516,12 @@ Ring::rewrap(column_t columns,
+ 						"      Marker #%d will be here in row %lu\n", i, new_row_index);
+ 			}
+ 		}
++
++#ifdef WITH_SIXEL
++		if (!rewrap_images_in_range(image_it, new_record.text_start_offset, paragraph_end_text_offset, new_row_index))
++			goto err;
++#endif
++
+ 		new_row_index++;
+ 		paragraph_start_text_offset = paragraph_end_text_offset;
+ 	}
+@@ -1380,6 +1554,10 @@ Ring::rewrap(column_t columns,
+ 	g_free(marker_text_offsets);
+ 	g_free(new_markers);
+ 
++#ifdef WITH_SIXEL
++	rebuild_image_top_map();
++#endif
++
+ 	_vte_debug_print(VTE_DEBUG_RING, "Ring after rewrapping:\n");
+         validate();
+ 	return;
+@@ -1483,3 +1661,40 @@ Ring::write_contents(GOutputStream* stream,
+ 
+ 	return true;
+ }
++
++#ifdef WITH_SIXEL
++
++/**
++ * Ring::append_image:
++ * @surface: A Cairo surface object
++ * @pixelwidth: Image width in pixels
++ * @pixelheight: Image height in pixels
++ * @left: Left position of image in cell units
++ * @top: Top position of image in cell units
++ * @cell_width: Width of image in cell units
++ * @cell_height: Height of image in cell units
++ *
++ * Append an image to the internal image list.
++ */
++void
++Ring::append_image (cairo_surface_t *surface, gint pixelwidth, gint pixelheight, glong left, glong top, glong cell_width, glong cell_height)
++{
++        Image *image;
++
++        image = new (std::nothrow) Image (vte::cairo::Surface(surface),
++                                          m_next_image_priority++,
++                                          pixelwidth, pixelheight,
++                                          left, top,
++                                          cell_width, cell_height);
++        if (!image)
++                return;
++
++        m_image_by_top_map->insert (std::make_pair (image->get_top (), image));
++        m_image_priority_map->insert (std::make_pair (image->get_priority (), image));
++        m_image_fast_memory_used += image->resource_size ();
++
++        image_gc_region();
++        image_gc();
++}
++
++#endif /* WITH_SIXEL */
+diff --git a/src/ring.hh b/src/ring.hh
+index 87b7364..85fd723 100644
+--- a/src/ring.hh
++++ b/src/ring.hh
+@@ -28,6 +28,11 @@
+ #include "vterowdata.hh"
+ #include "vtestream.h"
+ 
++#ifdef WITH_SIXEL
++#include "image.hh"
++#include <map>
++#endif
++
+ #include <type_traits>
+ 
+ typedef struct _VteVisualPosition {
+@@ -98,6 +103,15 @@ public:
+                             GCancellable* cancellable,
+                             GError** error);
+ 
++#ifdef WITH_SIXEL
++        void append_image (cairo_surface_t *surface,
++                           gint pixelwidth, gint pixelheight,
++                           glong left, glong top,
++                           glong cell_width, glong cell_height);
++        std::map<gint, vte::image::Image *> *m_image_by_top_map;
++        std::map<int, vte::image::Image *> *m_image_priority_map;
++#endif
++
+ private:
+ 
+         #ifdef VTE_DEBUG
+@@ -226,6 +240,20 @@ private:
+         hyperlink_idx_t m_hyperlink_hover_idx{0};  /* The hyperlink idx of the hovered cell.
+                                                  An idx is allocated on hover even if the cell is scrolled out to the streams. */
+         row_t m_hyperlink_maybe_gc_counter{0};  /* Do a GC when it reaches 65536. */
++
++#ifdef WITH_SIXEL
++        /* Image bookkeeping */
++
++        void image_gc();
++        void image_gc_region();
++        void unlink_image_from_top_map(vte::image::Image *image);
++        void rebuild_image_top_map();
++        bool rewrap_images_in_range(std::map<int,vte::image::Image*>::iterator &it,
++                                    size_t text_start_ofs, size_t text_end_ofs, row_t new_row_index);
++
++        int m_next_image_priority;
++        unsigned int m_image_fast_memory_used;
++#endif /* WITH_SIXEL */
+ };
+ 
+ }; /* namespace base */
+diff --git a/src/sixel-test.cc b/src/sixel-test.cc
+new file mode 100644
+index 0000000..3746f69
+--- /dev/null
++++ b/src/sixel-test.cc
+@@ -0,0 +1,763 @@
++/*
++ * Copyright © 2020 Hans Petter Jansson <hpj@cl.no>
++ *
++ * This library is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 3 of the License, or (at your option) any later version.
++ *
++ * This library is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public License
++ * along with this program.  If not, see <https://www.gnu.org/licenses/>.
++ */
++
++#include "config.h"
++
++#include <assert.h>
++#include <errno.h>
++#include <stdlib.h>
++#include <string.h>
++#include <stdint.h>
++#include <stdio.h>
++
++#include <termios.h>  /* TIOCGWINSZ */
++#include <sys/ioctl.h>  /* ioctl() */
++
++#include <glib.h>
++
++/* The image data is stored as a series of palette indexes, with 16 bits
++ * per pixel and TRANSPARENT_SLOT indicating transparency. This allows for
++ * palette sizes up to 65535 colors.
++ *
++ * TRANSPARENT_SLOT can be any u16 value. Typically, the first or last
++ * slot (0, n_colors) is used. The transparency index is never emitted;
++ * instead pixels with this value are left blank in the output. */
++
++#define N_COLORS_MAX 65536
++#define TRANSPARENT_SLOT ((N_COLORS_MAX) - 1)
++
++#define WIDTH_MAX 65536
++#define HEIGHT_MAX 65536
++
++#define N_PIXELS_IN_SIXEL 6
++
++#define PRE_SEQ "\x1bP"
++#define POST_SEQ "\x1b\\"
++
++#define TEST_IMAGE_SIZE_MIN 16
++#define TEST_IMAGE_SIZE_MAX 512
++
++/* Big palettes make our toy printer extremely slow; use with caution */
++#define TEST_PALETTE_SIZE_MIN 1
++#define TEST_PALETTE_SIZE_MAX 16
++
++/* --- Helpers --- */
++
++static int
++random_int_in_range (int min, int max)
++{
++        if (min == max)
++                return min;
++
++        if (min > max) {
++                int t = max;
++                max = min;
++                min = t;
++        }
++
++        return min + (random () % (max - min));
++}
++
++static int
++round_up_to_multiple (int n, int m)
++{
++        n += m - 1;
++        return n - (n % m);
++}
++
++static int
++round_down_to_multiple (int n, int m)
++{
++        return round_up_to_multiple (n, m + 1) - m;
++}
++
++static void
++memset_u16 (uint16_t *buf, uint16_t val, int n)
++{
++        int i;
++
++        for (i = 0; i < n; i++) {
++                buf [i] = val;
++        }
++}
++
++static uint16_t
++pen_to_slot (int i)
++{
++        if (i >= TRANSPARENT_SLOT)
++                return i + 1;
++
++        return i;
++}
++
++static uint8_t
++interp_u8 (uint8_t a, uint8_t b, int fraction, int total)
++{
++        uint32_t ta, tb;
++
++        assert (fraction >= 0 && fraction <= total);
++
++        /* Only one color in palette */
++        if (total == 0)
++                return a;
++
++        ta = (uint32_t) a * (total - fraction) / total;
++        tb = (uint32_t) b * fraction / total;
++
++        return ta + tb;
++}
++
++static uint32_t
++interp_colors (uint32_t a, uint32_t b, int fraction, int total)
++{
++        return interp_u8 (a, b, fraction, total)
++                | (interp_u8 (a >> 8, b >> 8, fraction, total) << 8)
++                | (interp_u8 (a >> 16, b >> 16, fraction, total) << 16)
++                | (interp_u8 (a >> 24, b >> 24, fraction, total) << 24);
++}
++
++static int
++transform_range (int n, int old_min, int old_max, int new_min, int new_max)
++{
++        if (new_min == new_max)
++                return new_min;
++
++        if (n < old_min)
++                n = old_min;
++        if (n > old_max)
++                n = old_max;
++
++        return ((n - old_min) * (new_max - new_min) / (old_max - old_min)) + new_min;
++}
++
++/* Transform to sixel color channels, which are in the 0..100 range. */
++static void
++argb_to_sixel_rgb (uint32_t argb, int *r, int *g, int *b)
++{
++        *r = transform_range ((argb >> 16) & 0xff, 0, 256, 0, 101);
++        *g = transform_range ((argb >> 8) & 0xff, 0, 256, 0, 101);
++        *b = transform_range (argb & 0xff, 0, 256, 0, 101);
++}
++
++/* --- Image gen and sixel conversion --- */
++
++typedef struct
++{
++        int width, height;
++        int n_colors;
++        uint32_t palette [N_COLORS_MAX];
++        uint16_t *pixels;
++}
++Image;
++
++static void
++image_init (Image *image, int width, int height, int n_colors)
++{
++        int alloc_height;
++        int n_pixels;
++
++        assert (width > 0 && width <= WIDTH_MAX);
++        assert (height > 0 && height <= HEIGHT_MAX);
++        assert (n_colors > 0 && n_colors < N_COLORS_MAX);
++
++        image->width = width;
++        image->height = height;
++        image->n_colors = n_colors;
++
++        alloc_height = round_up_to_multiple (height, N_PIXELS_IN_SIXEL);
++
++        n_pixels = width * alloc_height;
++        image->pixels = (uint16_t *) malloc (n_pixels * sizeof (uint16_t));
++        memset_u16 (image->pixels, TRANSPARENT_SLOT, n_pixels);
++}
++
++static void
++image_deinit (Image *image)
++{
++        free (image->pixels);
++        image->pixels = NULL;
++}
++
++static void
++image_generate_palette (Image *image, uint32_t first_color, uint32_t last_color)
++{
++        int pen;
++
++        for (pen = 0; pen < image->n_colors; pen++) {
++                image->palette [pen_to_slot (pen)]
++                        = interp_colors (first_color, last_color, pen, image->n_colors - 1);
++        }
++}
++
++static void
++image_set_pixel (Image *image, int x, int y, uint16_t value)
++{
++        image->pixels [y * image->width + x] = value;
++}
++
++static uint16_t
++image_get_pixel (const Image *image, int x, int y)
++{
++        return image->pixels [y * image->width + x];
++}
++
++static uint8_t
++image_get_sixel (const Image *image, int x, int y, uint16_t value)
++{
++        uint8_t sixel = 0;
++        int i;
++
++        for (i = 0; i < N_PIXELS_IN_SIXEL; i++) {
++                uint16_t p = image_get_pixel (image, x, y + N_PIXELS_IN_SIXEL - 1 - i);
++
++                sixel <<= 1;
++                if (p == value)
++                        sixel |= 1;
++        }
++
++        return sixel;
++}
++
++static void
++image_draw_shape (Image *image)
++{
++        int y, x;
++
++        for (y = 0; y < image->height; y++) {
++                int pen = ((image->n_colors - 1) * y + image->height / 2) / image->height;
++
++                for (x = 0; x < image->width; x++) {
++                        if (x == 0 || x == image->width - 1          /* Box left/right */
++                            || y == 0 || y == image->height - 1      /* Box top/bottom */
++                            || y == x || y == image->width - 1 - x)  /* X diagonals */
++                                image_set_pixel (image, x, y, pen_to_slot (pen));
++                }
++        }
++}
++
++static void
++image_generate (Image *image, uint32_t first_color, uint32_t last_color)
++{
++        image_generate_palette (image, first_color, last_color);
++        image_draw_shape (image);
++}
++
++static void
++image_print_sixels_palette (const Image *image, GString *gstr)
++{
++        int pen;
++
++        for (pen = 0; pen < image->n_colors; pen++) {
++                uint32_t col = image->palette [pen_to_slot (pen)];
++                int r, g, b;
++
++                argb_to_sixel_rgb (col, &r, &g, &b);
++                g_string_append_printf (gstr, "#%d;2;%d;%d;%d",
++                                        pen_to_slot (pen), r, g, b);
++        }
++}
++
++static void
++emit_sixels (GString *gstr, uint8_t sixel, int n, uint16_t slot,
++             bool pass_ended, uint16_t *emitted_slot_inout,
++             bool *need_emit_cr_inout, bool *need_emit_cr_inout_next)
++{
++        if (n == 0) {
++                return;
++        }
++
++        if (!pass_ended || sixel != 0) {
++                char c = '?' + (char) sixel;
++
++                if (*need_emit_cr_inout) {
++                        g_string_append_c (gstr, '$');
++                        *need_emit_cr_inout = FALSE;
++                }
++
++                if (slot != *emitted_slot_inout) {
++                        g_string_append_printf (gstr, "#%d", slot);
++                        *emitted_slot_inout = slot;
++                }
++
++                while (n > 255) {
++                        g_string_append_printf (gstr, "!255%c", c);
++                        n -= 255;
++                }
++
++                if (n >= 4) {
++                        g_string_append_printf (gstr, "!%d%c", n, c);
++                        n = 0;
++                } else {
++                        for ( ; n > 0; n--)
++                                g_string_append_c (gstr, c);
++                }
++        }
++
++        if (sixel != 0)
++                *need_emit_cr_inout_next = TRUE;
++}
++
++static void
++image_print_sixels_row (const Image *image, GString *gstr, int y, uint16_t *emitted_slot_inout)
++{
++        bool need_emit_cr = FALSE;
++        bool need_emit_cr_next = FALSE;
++        int pen;
++
++        for (pen = 0; pen < image->n_colors; pen++) {
++                uint16_t slot = pen_to_slot (pen);
++                uint8_t cur_sixel = 0;
++                int n_cur_sixel = 0;
++                int x;
++
++                for (x = 0; x < image->width; x++) {
++                        uint8_t next_sixel = image_get_sixel (image, x, y, slot);
++
++                        if (next_sixel == cur_sixel) {
++                                n_cur_sixel++;
++                                continue;
++                        }
++
++                        emit_sixels (gstr, cur_sixel, n_cur_sixel, slot, FALSE,
++                                     emitted_slot_inout, &need_emit_cr, &need_emit_cr_next);
++                        cur_sixel = next_sixel;
++                        n_cur_sixel = 1;
++                }
++
++                emit_sixels (gstr, cur_sixel, n_cur_sixel, slot, TRUE,
++                             emitted_slot_inout, &need_emit_cr, &need_emit_cr_next);
++                need_emit_cr = need_emit_cr_next;
++        }
++
++        /* CR + Linefeed */
++        g_string_append_c (gstr, '-');
++}
++
++static void
++image_print_sixels_data (const Image *image, GString *gstr)
++{
++        uint16_t emitted_slot = TRANSPARENT_SLOT;
++        int y;
++
++        for (y = 0; y < image->height; y += N_PIXELS_IN_SIXEL) {
++                image_print_sixels_row (image, gstr, y, &emitted_slot);
++        }
++}
++
++static void
++image_print_sixels (const Image *image, GString *gstr)
++{
++        g_string_append_printf (gstr, PRE_SEQ "0;0;0q\"1;1;%d;%d",
++                                image->width, image->height);
++        image_print_sixels_palette (image, gstr);
++        image_print_sixels_data (image, gstr);
++        g_string_append (gstr, POST_SEQ);
++}
++
++/* --- Main loop and printing --- */
++
++typedef enum
++{
++        TEST_MODE_UNSET,
++        TEST_MODE_FUZZ
++}
++TestMode;
++
++typedef struct
++{
++        TestMode mode;
++
++        float delay;
++        int n_errors;
++        int n_frames;
++        int seed;
++        int n_scroll;
++
++        int term_width_cells, term_height_cells;
++        int term_width_pixels, term_height_pixels;
++
++        int term_cell_width, term_cell_height;
++}
++Options;
++
++static void
++cursor_to_offset (gint x, gint y, GString *gstr)
++{
++        g_string_printf (gstr, "\x1b[%d;%df", y, x);
++}
++
++static void
++cursor_to_random_offset (gint x_max, gint y_max, GString *gstr)
++{
++        cursor_to_offset (random_int_in_range (0, x_max),
++                          random_int_in_range (0, y_max),
++                          gstr);
++}
++
++static void
++scroll_n_lines (const Options *options, int n, GString *gstr)
++{
++        if (n < 1)
++                return;
++
++        cursor_to_offset (0, options->term_height_cells, gstr);
++        for (int i = 0; i < n; i++)
++                g_string_append_printf (gstr, "\n");
++}
++
++static void
++print_text (const gchar *text, GString *gstr)
++{
++        g_string_append (gstr, text);
++}
++
++static void
++print_random_image (const Options *options, GString *gstr)
++{
++        int dim_max = MIN (TEST_IMAGE_SIZE_MAX,
++                           MAX (TEST_IMAGE_SIZE_MIN,
++                                MIN (options->term_width_pixels,
++                                     round_down_to_multiple (options->term_height_pixels - options->term_cell_height,
++                                                             N_PIXELS_IN_SIXEL))));
++        int dim = random_int_in_range (TEST_IMAGE_SIZE_MIN, dim_max + 1);
++        Image image;
++
++        image_init (&image, dim, dim,
++                    random_int_in_range (TEST_PALETTE_SIZE_MIN, TEST_PALETTE_SIZE_MAX));
++
++        /* In order to produce colors that contrast both white and black backgrounds,
++         * limit the range of the red component. This doesn't work reliably with grey
++         * backgrounds, but eh. */
++        image_generate (&image,
++                        random_int_in_range (0x00400000, 0x00a00000),
++                        random_int_in_range (0x00400000, 0x00a00000));
++
++        cursor_to_random_offset ((options->term_width_pixels - dim) / options->term_cell_width,
++                                 (options->term_height_pixels - dim) / options->term_cell_height,
++                                 gstr);
++        image_print_sixels (&image, gstr);
++
++        image_deinit (&image);
++}
++
++static void
++print_random_text (const Options *options, GString *gstr)
++{
++        cursor_to_random_offset (options->term_width_cells - strlen ("Hallo!"),
++                                 options->term_height_cells,
++                                 gstr);
++        print_text ("Hallo!", gstr);
++}
++
++typedef enum
++{
++        FUZZ_REPLACE,
++        FUZZ_COPY,
++        FUZZ_SWAP,
++
++        FUZZ_MAX
++}
++FuzzType;
++
++static void
++fuzz_replace (GString *gstr)
++{
++        int a, b;
++
++        a = random_int_in_range (0, gstr->len - 1);
++        b = a + random_int_in_range (0, MIN (gstr->len - a, 64));
++
++        for (int i = a; i < b; i++) {
++                gstr->str [i] = random_int_in_range (1, 256);
++        }
++}
++
++static void
++fuzz_copy (GString *gstr)
++{
++        int a, b, c;
++
++        a = random_int_in_range (0, gstr->len - 1);
++        b = random_int_in_range (0, MIN (gstr->len - a, 64));
++        c = random_int_in_range (0, gstr->len - b);
++
++        memcpy (gstr->str + c, gstr->str + a, b);
++}
++
++static void
++fuzz_swap (GString *gstr)
++{
++        unsigned char buf [64];
++        int a, b, c;
++
++        a = random_int_in_range (0, gstr->len - 1);
++        b = random_int_in_range (0, MIN (gstr->len - a, 64));
++        c = random_int_in_range (0, gstr->len - b);
++
++        memcpy (buf, gstr->str + c, b);
++        memcpy (gstr->str + c, gstr->str + a, b);
++        memcpy (gstr->str + c, buf, b);
++}
++
++static void
++random_fuzz (const Options *options, GString *gstr)
++{
++        if (gstr->len < 1)
++                return;
++
++        for (int i = 0; i < options->n_errors; i++) {
++                FuzzType fuzz_type = FuzzType(random () % FUZZ_MAX);
++
++                switch (fuzz_type) {
++                        case FUZZ_REPLACE:
++                                fuzz_replace (gstr);
++                                break;
++                        case FUZZ_COPY:
++                                fuzz_copy (gstr);
++                                break;
++                        case FUZZ_SWAP:
++                                fuzz_swap (gstr);
++                                break;
++                        default:
++                                break;
++                }
++        }
++}
++
++static void
++print_loop (const Options *options)
++{
++        for (int i = 0; options->n_frames == 0 || i < options->n_frames; i++) {
++                GString *gstr;
++
++                gstr = g_string_new ("");
++
++                scroll_n_lines (options, options->n_scroll, gstr);
++
++                if (random () % 2) {
++                        print_random_image (options, gstr);
++                } else {
++                        print_random_text (options, gstr);
++                }
++
++                random_fuzz (options, gstr);
++
++                fwrite (gstr->str, sizeof (char), gstr->len, stdout);
++                g_string_free (gstr, TRUE);
++                fflush (stdout);
++
++                if (options->delay > 0.000001f)
++                        g_usleep (options->delay * 1000000.0f);
++        }
++}
++
++/* --- Argument parsing and init --- */
++
++static bool
++parse_int (const char *arg, const char *val, int *out)
++{
++        char *endptr;
++        int ret;
++        bool result = FALSE;
++
++        assert (arg != NULL);
++        assert (val != NULL);
++        assert (out != NULL);
++
++        if (*val == '\0') {
++                fprintf (stderr, "Empty value for argument '%s'. Aborting.\n", arg);
++                goto out;
++        }
++
++        ret = strtol (val, &endptr, 10);
++
++        if (*endptr != '\0') {
++                fprintf (stderr, "Unrecognized value for argument '%s': '%s'. Aborting.\n", arg, val);
++                goto out;
++        }
++
++        *out = ret;
++        result = TRUE;
++
++out:
++        return result;
++}
++
++static bool
++parse_float (const char *arg, const char *val, float *out)
++{
++        char *endptr;
++        float ret;
++        bool result = FALSE;
++
++        assert (arg != NULL);
++        assert (val != NULL);
++        assert (out != NULL);
++
++        if (*val == '\0') {
++                fprintf (stderr, "Empty value for argument '%s'. Aborting.\n", arg);
++                goto out;
++        }
++
++        ret = strtof (val, &endptr);
++
++        if (*endptr != '\0') {
++                fprintf (stderr, "Unrecognized value for argument '%s': '%s'. Aborting.\n", arg, val);
++                goto out;
++        }
++
++        *out = ret;
++        result = TRUE;
++
++out:
++        return result;
++}
++
++static bool
++parse_options (Options *options, int argc, char **argv)
++{
++        bool result = FALSE;
++        int i;
++
++        if (argc < 2) {
++                fprintf (stderr, "Usage: %s <mode> [options]\n\n"
++                         "Modes:\n"
++                         "    fuzz        Perform fuzzing test.\n\n"
++                         "Options:\n"
++                         "    -d <float>  Delay between frames, in seconds (default: 0.0).\n"
++                         "    -e <int>    Maximum number of random errors per frame (default: 0).\n"
++                         "    -n <int>    Number of frames to output (default: infinite).\n"
++                         "    -r <int>    Random seed to use (default: current time).\n"
++                         "    -s <int>    Number of lines to scroll for each frame (default: 0).\n\n",
++                         argv [0]);
++                goto out;
++        }
++
++        for (i = 1; i < argc; ) {
++                const char *arg = argv [i];
++                const char *val;
++
++                if (!strcmp (arg, "fuzz")) {
++                        options->mode = TEST_MODE_FUZZ;
++                        i++;
++                        continue;
++                }
++
++                if (i + 1 >= argc)
++                        break;
++
++                val = argv [i + 1];
++
++                if (!strcmp (arg, "-d")) {
++                        if (!parse_float (arg, val, &options->delay))
++                                goto out;
++                        i += 2;
++                } else if (!strcmp (arg, "-e")) {
++                        if (!parse_int (arg, val, &options->n_errors))
++                                goto out;
++                        i += 2;
++                } else if (!strcmp (arg, "-n")) {
++                        if (!parse_int (arg, val, &options->n_frames))
++                                goto out;
++                        i += 2;
++                } else if (!strcmp (arg, "-r")) {
++                        if (!parse_int (arg, val, &options->seed))
++                                goto out;
++                        i += 2;
++                } else if (!strcmp (arg, "-s")) {
++                        if (!parse_int (arg, val, &options->n_scroll))
++                                goto out;
++                        i += 2;
++                } else {
++                        fprintf (stderr, "Unrecognized option '%s'. Aborting.\n", arg);
++                        goto out;
++                }
++        }
++
++        if (i != argc) {
++                fprintf (stderr, "Stray option '%s'. Aborting.\n", argv [i]);
++                goto out;
++        }
++
++        if (options->mode == TEST_MODE_UNSET) {
++                fprintf (stderr, "No test mode specified. Try \"fuzz\".\n");
++                goto out;
++        }
++
++        result = TRUE;
++
++out:
++        return result;
++}
++
++static bool
++query_terminal (Options *options)
++{
++        struct winsize wsz;
++
++        if (ioctl (fileno (stdout), TIOCGWINSZ, &wsz) != 0) {
++                fprintf (stderr, "ioctl() failed: %s\n", strerror (errno));
++                return FALSE;
++        }
++
++        options->term_width_cells = wsz.ws_col;
++        options->term_height_cells = wsz.ws_row;
++        options->term_width_pixels = wsz.ws_xpixel;
++        options->term_height_pixels = wsz.ws_ypixel;
++
++        if (options->term_width_cells < 4
++            || options->term_height_cells < 4) {
++                fprintf (stderr, "Terminal window is too small (must be greater than 4x4 cells).\n");
++                return FALSE;
++        }
++
++        if (options->term_width_pixels == 0
++            || options->term_height_pixels == 0) {
++                fprintf (stderr, "Terminal did not report its pixel size.\n");
++                return FALSE;
++        }
++
++        if (options->term_width_pixels < 16
++            || options->term_height_pixels < 16) {
++                fprintf (stderr, "Terminal window is too small (must be greater than 16x16 pixels).\n");
++                return FALSE;
++        }
++
++        options->term_cell_width = wsz.ws_xpixel / wsz.ws_col;
++        options->term_cell_height = wsz.ws_ypixel / wsz.ws_row;
++
++        return TRUE;
++}
++
++/* --- Entry point --- */
++
++int
++main (int argc, char *argv [])
++{
++        static Options options = { };
++
++        options.seed = (int) time (NULL);
++
++        if (!parse_options (&options, argc, argv))
++                return 1;
++
++        if (!query_terminal (&options))
++                return 2;
++
++        print_loop (&options);
++        return 0;
++}
+diff --git a/src/sixelparser.cc b/src/sixelparser.cc
+new file mode 100644
+index 0000000..3eada49
+--- /dev/null
++++ b/src/sixelparser.cc
+@@ -0,0 +1,713 @@
++/*
++ * Copyright © 2016-2020 Hayaki Saito
++ * Copyright © 2020 Hans Petter Jansson
++ * originally written by kmiya@cluti (https://github.com/saitoha/sixel/blob/master/fromsixel.c)
++ *
++ * This library is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU General Public
++ * License as published by the Free Software Foundation; either
++ * version 3 of the License, or (at your option) any later version.
++ *
++ * This library is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public License
++ * along with this program.  If not, see <https://www.gnu.org/licenses/>.
++ */
++
++#include <stdlib.h>
++#include <stdio.h>
++#include <stdint.h>
++#include <ctype.h>   /* isdigit */
++#include <string.h>  /* memcpy */
++#include <glib.h>
++
++#include "sixelparser.hh"
++
++#define PACK_RGB(r, g, b) ((r) + ((g) << 8) +  ((b) << 16))
++#define SCALE_VALUE(n,a,m) (((n) * (a) + ((m) / 2)) / (m))
++#define SCALE_AND_PACK_RGB(r,g,b) \
++        PACK_RGB(SCALE_VALUE(r, 255, 100), SCALE_VALUE(g, 255, 100), SCALE_VALUE(b, 255, 100))
++
++static const int sixel_default_color_table[] = {
++        SCALE_AND_PACK_RGB(0,  0,  0),   /*  0 Black    */
++        SCALE_AND_PACK_RGB(20, 20, 80),  /*  1 Blue     */
++        SCALE_AND_PACK_RGB(80, 13, 13),  /*  2 Red      */
++        SCALE_AND_PACK_RGB(20, 80, 20),  /*  3 Green    */
++        SCALE_AND_PACK_RGB(80, 20, 80),  /*  4 Magenta  */
++        SCALE_AND_PACK_RGB(20, 80, 80),  /*  5 Cyan     */
++        SCALE_AND_PACK_RGB(80, 80, 20),  /*  6 Yellow   */
++        SCALE_AND_PACK_RGB(53, 53, 53),  /*  7 Gray 50% */
++        SCALE_AND_PACK_RGB(26, 26, 26),  /*  8 Gray 25% */
++        SCALE_AND_PACK_RGB(33, 33, 60),  /*  9 Blue*    */
++        SCALE_AND_PACK_RGB(60, 26, 26),  /* 10 Red*     */
++        SCALE_AND_PACK_RGB(33, 60, 33),  /* 11 Green*   */
++        SCALE_AND_PACK_RGB(60, 33, 60),  /* 12 Magenta* */
++        SCALE_AND_PACK_RGB(33, 60, 60),  /* 13 Cyan*    */
++        SCALE_AND_PACK_RGB(60, 60, 33),  /* 14 Yellow*  */
++        SCALE_AND_PACK_RGB(80, 80, 80),  /* 15 Gray 75% */
++};
++
++/*
++ *  HLS-formatted color handling.
++ *  (0 degree = blue, double-hexcone model)
++ *  http://odl.sysworks.biz/disk$vaxdocdec021/progtool/d3qsaaa1.p64.bkb
++ */
++static int
++hls_to_rgb(int hue, int lum, int sat)
++{
++    double min, max;
++    int r, g, b;
++
++    if (sat == 0) {
++        r = g = b = lum;
++        return SCALE_AND_PACK_RGB(r, g, b);
++    }
++
++    /* https://wikimedia.org/api/rest_v1/media/math/render/svg/17e876f7e3260ea7fed73f69e19c71eb715dd09d */
++    max = lum + sat * (100 - (lum > 50 ? 1 : -1) * ((lum << 1) - 100)) / 200.0;
++
++    /* https://wikimedia.org/api/rest_v1/media/math/render/svg/f6721b57985ad83db3d5b800dc38c9980eedde1d */
++    min = lum - sat * (100 - (lum > 50 ? 1 : -1) * ((lum << 1) - 100)) / 200.0;
++
++    /* HLS hue color ring is rotated -120 degree from HSL's one. */
++    hue = (hue + 240) % 360;
++
++    /* https://wikimedia.org/api/rest_v1/media/math/render/svg/937e8abdab308a22ff99de24d645ec9e70f1e384 */
++    switch (hue / 60) {
++    case 0:  /* 0 <= hue < 60 */
++        r = max;
++        g = (min + (max - min) * (hue / 60.0));
++        b = min;
++        break;
++    case 1:  /* 60 <= hue < 120 */
++        r = min + (max - min) * ((120 - hue) / 60.0);
++        g = max;
++        b = min;
++        break;
++    case 2:  /* 120 <= hue < 180 */
++        r = min;
++        g = max;
++        b = (min + (max - min) * ((hue - 120) / 60.0));
++        break;
++    case 3:  /* 180 <= hue < 240 */
++        r = min;
++        g = (min + (max - min) * ((240 - hue) / 60.0));
++        b = max;
++        break;
++    case 4:  /* 240 <= hue < 300 */
++        r = (min + (max - min) * ((hue - 240) / 60.0));
++        g = min;
++        b = max;
++        break;
++    case 5:  /* 300 <= hue < 360 */
++    default:
++        r = max;
++        g = min;
++        b = (min + (max - min) * ((360 - hue) / 60.0));
++        break;
++    }
++
++    return SCALE_AND_PACK_RGB(r, g, b);
++}
++
++static int
++set_default_color(sixel_image_t *image)
++{
++        int r, g, b;
++        int i, n;
++
++        /* Palette initialization */
++        for (n = 1; n < 17; n++) {
++                image->palette[n] = sixel_default_color_table[n - 1];
++        }
++
++        /* Colors 17-232 are a 6x6x6 color cube */
++        for (r = 0; r < 6; r++) {
++                for (g = 0; g < 6; g++) {
++                        for (b = 0; b < 6; b++) {
++                                image->palette[n++] = PACK_RGB(r * 51, g * 51, b * 51);
++                        }
++                }
++        }
++
++        /* Colors 233-256 are a grayscale ramp */
++        for (i = 0; i < 24; i++) {
++                image->palette[n++] = PACK_RGB(i * 11, i * 11, i * 11);
++        }
++
++        for (; n < DECSIXEL_PALETTE_MAX; n++) {
++                image->palette[n] = PACK_RGB(255, 255, 255);
++        }
++
++        return 0;
++}
++
++static int
++sixel_image_init(sixel_image_t *image,
++                 int width, int height,
++                 int fgcolor, int bgcolor,
++                 int use_private_register)
++{
++        int status = -1;
++        size_t size;
++
++        size = (size_t)(width * height) * sizeof(sixel_color_no_t);
++        image->width = width;
++        image->height = height;
++        image->data = (sixel_color_no_t *) g_try_malloc0(size);
++        image->ncolors = 2;
++        image->use_private_register = use_private_register;
++
++        if (image->data == NULL)
++                goto out;
++
++        image->palette[0] = bgcolor;
++
++        if (image->use_private_register)
++                image->palette[1] = fgcolor;
++
++        image->palette_modified = 0;
++
++        status = 0;
++
++out:
++        return status;
++}
++
++
++static int
++image_buffer_resize(sixel_image_t *image, int width, int height)
++{
++        int status = -1;
++        size_t size;
++        sixel_color_no_t *alt_buffer;
++        int n;
++        int min_height;
++
++        if (width == image->width && height == image->height)
++                return 0;
++
++        size = (size_t)(width * height) * sizeof(sixel_color_no_t);
++        alt_buffer = (sixel_color_no_t *) g_try_malloc(size);
++        if (alt_buffer == NULL) {
++                status = -1;
++                goto out;
++        }
++
++        min_height = height > image->height ? image->height: height;
++        if (width > image->width) {
++                /* Wider */
++                for (n = 0; n < min_height; ++n) {
++                        /* Copy from source image */
++                        memcpy(alt_buffer + width * n,
++                               image->data + image->width * n,
++                               (size_t)image->width * sizeof(sixel_color_no_t));
++                        /* Fill extended area with background color */
++                        memset(alt_buffer + width * n + image->width,
++                               0,
++                               (size_t)(width - image->width) * sizeof(sixel_color_no_t));
++                }
++        } else {
++                /* Narrower or the same width */
++                for (n = 0; n < min_height; ++n) {
++                        /* Copy from source image */
++                        memcpy(alt_buffer + width * n,
++                               image->data + image->width * n,
++                               (size_t)width * sizeof(sixel_color_no_t));
++                }
++        }
++
++        if (height > image->height) {
++                /* Fill extended area with background color */
++                memset(alt_buffer + width * image->height,
++                       0,
++                       (size_t)(width * (height - image->height)) * sizeof(sixel_color_no_t));
++        }
++
++        /* Free source image */
++        g_free(image->data);
++
++        image->data = alt_buffer;
++        image->width = width;
++        image->height = height;
++
++        status = 0;
++
++out:
++        if (status < 0) {
++                /* Free source image */
++                g_free(image->data);
++                image->data = NULL;
++        }
++
++        return status;
++}
++
++static int
++image_buffer_ensure_min_size(sixel_image_t *image, int req_width, int req_height)
++{
++        int status = 0;
++
++        if ((image->width < req_width || image->height < req_height)
++            && image->width < DECSIXEL_WIDTH_MAX && image->height < DECSIXEL_HEIGHT_MAX) {
++                int sx = image->width * 2;
++                int sy = image->height * 2;
++
++                while (sx < req_width || sy < req_height) {
++                        sx *= 2;
++                        sy *= 2;
++                }
++
++                if (sx > DECSIXEL_WIDTH_MAX)
++                        sx = DECSIXEL_WIDTH_MAX;
++                if (sy > DECSIXEL_HEIGHT_MAX)
++                        sy = DECSIXEL_HEIGHT_MAX;
++
++                status = image_buffer_resize(image, sx, sy);
++        }
++
++        return status;
++}
++
++static void
++sixel_image_deinit(sixel_image_t *image)
++{
++        g_free(image->data);
++        image->data = NULL;
++}
++
++static int
++parser_transition(sixel_state_t *st, parse_state_t new_state)
++{
++        st->state = new_state;
++        st->nparams = 0;
++        st->param = -1;
++
++        return 0;
++}
++
++static int
++parser_push_param_ascii_dec_digit(sixel_state_t *st, uint32_t ascii_dec_digit)
++{
++        if (st->param < 0)
++                st->param = 0;
++
++        st->param = st->param * 10 + ascii_dec_digit - '0';
++        return 0;
++}
++
++static int
++parser_collect_param(sixel_state_t *st)
++{
++        if (st->param < 0 || st->nparams >= DECSIXEL_PARAMS_MAX)
++                return 0;
++
++        if (st->param > DECSIXEL_PARAMVALUE_MAX)
++                st->param = DECSIXEL_PARAMVALUE_MAX;
++
++        st->params[st->nparams++] = st->param;
++        st->param = -1;
++        return 0;
++}
++
++static int
++parser_collect_param_or_zero(sixel_state_t *st)
++{
++        if (st->param < 0)
++                st->param = 0;
++
++        parser_collect_param (st);
++        return 0;
++}
++
++static void
++draw_sixels(sixel_state_t *st, uint32_t bits)
++{
++        sixel_image_t *image = &st->image;
++
++        if (bits == 0)
++                return;
++
++        if (st->repeat_count <= 1) {
++                uint32_t sixel_vertical_mask = 0x01;
++
++                for (int i = 0; i < 6; i++) {
++                        if ((bits & sixel_vertical_mask) != 0) {
++                                int pos = image->width * (st->pos_y + i) + st->pos_x;
++                                image->data[pos] = st->color_index;
++                                if (st->max_x < st->pos_x)
++                                        st->max_x = st->pos_x;
++                                if (st->max_y < (st->pos_y + i))
++                                        st->max_y = st->pos_y + i;
++                        }
++                        sixel_vertical_mask <<= 1;
++                }
++        } else {
++                uint32_t sixel_vertical_mask = 0x01;
++
++                /* st->repeat_count > 1 */
++                for (int i = 0; i < 6; i++) {
++                        if ((bits & sixel_vertical_mask) != 0) {
++                                uint32_t c = sixel_vertical_mask << 1;
++                                int n;
++
++                                for (n = 1; (i + n) < 6; n++) {
++                                        if ((bits & c) == 0)
++                                                break;
++                                        c <<= 1;
++                                }
++                                for (int y = st->pos_y + i; y < st->pos_y + i + n; ++y) {
++                                        for (int x = st->pos_x; x < st->pos_x + st->repeat_count; ++x)
++                                                image->data[image->width * y + x] = st->color_index;
++                                }
++                                if (st->max_x < (st->pos_x + st->repeat_count - 1))
++                                        st->max_x = st->pos_x + st->repeat_count - 1;
++                                if (st->max_y < (st->pos_y + i + n - 1))
++                                        st->max_y = st->pos_y + i + n - 1;
++                                i += (n - 1);
++                                sixel_vertical_mask <<= (n - 1);
++                        }
++
++                        sixel_vertical_mask <<= 1;
++                }
++        }
++}
++
++static int
++parser_action_sixel_char(sixel_state_t *st, uint32_t raw)
++{
++        sixel_image_t *image = &st->image;
++        int status = -1;
++
++        if (raw >= '?' && raw <= '~') {
++                status = image_buffer_ensure_min_size (image,
++                                                       st->pos_x + st->repeat_count,
++                                                       st->pos_y + 6);
++                if (status < 0)
++                        goto out;
++
++                if (st->color_index > image->ncolors)
++                        image->ncolors = st->color_index;
++
++                st->repeat_count = MIN(st->repeat_count, image->width - st->pos_x);
++
++                if (st->repeat_count > 0 && st->pos_y + 5 < image->height) {
++                        uint32_t bits = raw - '?';
++                        draw_sixels(st, bits);
++                }
++
++                if (st->repeat_count > 0)
++                        st->pos_x += st->repeat_count;
++                st->repeat_count = 1;
++        }
++
++        status = 0;
++
++out:
++        return status;
++}
++
++static int
++parser_action_decgcr(sixel_state_t *st)
++{
++        st->pos_x = 0;
++        return 0;
++}
++
++static int
++parser_action_decgnl(sixel_state_t *st)
++{
++        st->pos_x = 0;
++
++        if (st->pos_y < DECSIXEL_HEIGHT_MAX - 5 - 6)
++                st->pos_y += 6;
++        else
++                st->pos_y = DECSIXEL_HEIGHT_MAX + 1;
++
++        return 0;
++}
++
++
++static int
++parser_action_decgra(sixel_state_t *st)
++{
++        sixel_image_t *image = &st->image;
++        int status = 0;
++
++        if (st->nparams > 0)
++                st->attributed_pad = st->params[0];
++        if (st->nparams > 1)
++                st->attributed_pan = st->params[1];
++        if (st->nparams > 2 && st->params[2] > 0)
++                st->attributed_ph = st->params[2];
++        if (st->nparams > 3 && st->params[3] > 0)
++                st->attributed_pv = st->params[3];
++
++        if (st->attributed_pan <= 0)
++                st->attributed_pan = 1;
++        if (st->attributed_pad <= 0)
++                st->attributed_pad = 1;
++
++        if (image->width < st->attributed_ph ||
++            image->height < st->attributed_pv) {
++                int sx = MIN (MAX (image->width, st->attributed_ph), DECSIXEL_WIDTH_MAX);
++                int sy = MIN (MAX (image->height, st->attributed_pv), DECSIXEL_HEIGHT_MAX);
++
++                status = image_buffer_resize(image, sx, sy);
++        }
++
++        return status;
++}
++
++static int
++parser_action_decgri(sixel_state_t *st)
++{
++        st->repeat_count = MAX (st->param, 1);
++        return 0;
++}
++
++static int
++parser_action_decgci(sixel_state_t *st)
++{
++        sixel_image_t *image = &st->image;
++
++        if (st->nparams > 0) {
++                st->color_index = 1 + st->params[0];  /* offset 1 (background color) added */
++                if (st->color_index < 0)
++                        st->color_index = 0;
++                else if (st->color_index >= DECSIXEL_PALETTE_MAX)
++                        st->color_index = DECSIXEL_PALETTE_MAX - 1;
++        }
++
++        if (st->nparams > 4) {
++                st->image.palette_modified = 1;
++                if (st->params[1] == 1) {
++                        /* HLS */
++                        if (st->params[2] > 360)
++                                st->params[2] = 360;
++                        if (st->params[3] > 100)
++                                st->params[3] = 100;
++                        if (st->params[4] > 100)
++                                st->params[4] = 100;
++                        image->palette[st->color_index]
++                                = hls_to_rgb(st->params[2], st->params[3], st->params[4]);
++                } else if (st->params[1] == 2) {
++                        /* RGB */
++                        if (st->params[2] > 100)
++                                st->params[2] = 100;
++                        if (st->params[3] > 100)
++                                st->params[3] = 100;
++                        if (st->params[4] > 100)
++                                st->params[4] = 100;
++                        image->palette[st->color_index]
++                                = SCALE_AND_PACK_RGB(st->params[2], st->params[3], st->params[4]);
++                }
++        }
++
++        return 0;
++}
++
++static int
++parser_feed_char(sixel_state_t *st, uint32_t raw)
++{
++        int status = -1;
++
++        for (;;) {
++                switch (st->state) {
++                case DECSIXEL_PS_DECSIXEL:
++                        switch (raw) {
++                        case 0x1b:
++                                return parser_transition(st, DECSIXEL_PS_ESC);
++                        case '"':
++                                return parser_transition(st, DECSIXEL_PS_DECGRA);
++                        case '!':
++                                return parser_transition(st, DECSIXEL_PS_DECGRI);
++                        case '#':
++                                return parser_transition(st, DECSIXEL_PS_DECGCI);
++                        case '$':
++                                /* DECGCR Graphics Carriage Return */
++                                return parser_action_decgcr(st);
++                        case '-':
++                                /* DECGNL Graphics Next Line */
++                                return parser_action_decgnl(st);
++                        }
++                        return parser_action_sixel_char(st, raw);
++
++                case DECSIXEL_PS_DECGRA:
++                        /* DECGRA Set Raster Attributes " Pan; Pad; Ph; Pv */
++                        switch (raw) {
++                        case 0x1b:
++                                return parser_transition(st, DECSIXEL_PS_ESC);
++                        case '0' ... '9':
++                                return parser_push_param_ascii_dec_digit(st, raw);
++                        case ';':
++                                return parser_collect_param(st);
++                        }
++
++                        parser_collect_param(st);
++                        status = parser_action_decgra(st);
++                        if (status < 0)
++                                return status;
++                        parser_transition(st, DECSIXEL_PS_DECSIXEL);
++                        continue;
++
++                case DECSIXEL_PS_DECGRI:
++                        /* DECGRI Graphics Repeat Introducer ! Pn Ch */
++                        switch (raw) {
++                        case 0x1b:
++                                return parser_transition(st, DECSIXEL_PS_ESC);
++                        case '0' ... '9':
++                                return parser_push_param_ascii_dec_digit(st, raw);
++                        }
++
++                        parser_action_decgri(st);
++                        parser_transition(st, DECSIXEL_PS_DECSIXEL);
++                        continue;
++
++                case DECSIXEL_PS_DECGCI:
++                        /* DECGCI Graphics Color Introducer # Pc; Pu; Px; Py; Pz */
++                        switch (raw) {
++                        case 0x1b:
++                                return parser_transition(st, DECSIXEL_PS_ESC);
++                        case '0' ... '9':
++                                return parser_push_param_ascii_dec_digit(st, raw);
++                        case ';':
++                                return parser_collect_param_or_zero(st);
++                        }
++
++                        parser_collect_param(st);
++                        parser_action_decgci(st);
++                        parser_transition(st, DECSIXEL_PS_DECSIXEL);
++                        continue;
++
++                case DECSIXEL_PS_ESC:
++                        /* The only escape code that can occur is end-of-input, "\x1b\\".
++                         * When we get to this state, just consume the rest quietly. */
++                        return 0;
++                }
++        } /* for (;;) */
++}
++
++int
++sixel_parser_init(sixel_state_t *st,
++                  int fgcolor, int bgcolor,
++                  int use_private_register)
++{
++        int status = -1;
++
++        st->state = DECSIXEL_PS_DECSIXEL;
++        st->pos_x = 0;
++        st->pos_y = 0;
++        st->max_x = 0;
++        st->max_y = 0;
++        st->attributed_pan = 2;
++        st->attributed_pad = 1;
++        st->attributed_ph = 0;
++        st->attributed_pv = 0;
++        st->repeat_count = 1;
++        st->color_index = 16;
++        st->nparams = 0;
++        st->param = -1;
++
++        status = sixel_image_init(&st->image, 1, 1, fgcolor, bgcolor, use_private_register);
++
++        return status;
++}
++
++void
++sixel_parser_deinit(sixel_state_t *st)
++{
++        sixel_image_deinit(&st->image);
++}
++
++int
++sixel_parser_finalize(sixel_state_t *st, unsigned char *pixels)
++{
++        int status = -1;
++        int sx;
++        int sy;
++        sixel_image_t *image = &st->image;
++        int x, y;
++        sixel_color_no_t *src;
++        unsigned char *dst;
++        int color;
++
++        if (++st->max_x < st->attributed_ph)
++                st->max_x = st->attributed_ph;
++
++        if (++st->max_y < st->attributed_pv)
++                st->max_y = st->attributed_pv;
++
++        sx = st->max_x;
++        sy = st->max_y;
++
++        status = image_buffer_resize(image,
++                                     MIN(image->width, sx),
++                                     MIN(image->height, sy));
++        if (status < 0)
++                goto out;
++
++        if (image->use_private_register && image->ncolors > 2 && !image->palette_modified) {
++                status = set_default_color(image);
++                if (status < 0)
++                        goto out;
++        }
++
++        src = st->image.data;
++        dst = pixels;
++        for (y = 0; y < st->image.height; ++y) {
++                for (x = 0; x < st->image.width; ++x) {
++                        sixel_color_no_t pen = *src++;
++
++                        /* FIXME-hpj: We may want to make this branch-free, among other
++                         * performance improvements. */
++
++                        if (pen == 0) {
++                                /* Cairo wants premultiplied alpha: Transparent
++                                 * areas must be all zeroes. */
++
++                                *dst++ = 0;
++                                *dst++ = 0;
++                                *dst++ = 0;
++                                *dst++ = 0;
++                        } else {
++                                color = st->image.palette[pen];
++                                *dst++ = color >> 16 & 0xff;   /* b */
++                                *dst++ = color >> 8 & 0xff;    /* g */
++                                *dst++ = color >> 0 & 0xff;    /* r */
++                                *dst++ = 0xff;                 /* a */
++                        }
++                }
++        }
++
++        status = 0;
++
++out:
++        return status;
++}
++
++int
++sixel_parser_set_default_color(sixel_state_t *st)
++{
++        return set_default_color(&st->image);
++}
++
++int
++sixel_parser_feed(sixel_state_t *st, const uint32_t *raw, size_t len)
++{
++        int status = 0;
++
++        if (!st->image.data)
++                return -1;
++
++        for (const uint32_t *p = raw; p < raw + len; p++) {
++                status = parser_feed_char(st, *p);
++                if (status < 0)
++                        break;
++        }
++
++        return status;
++}
+diff --git a/src/sixelparser.hh b/src/sixelparser.hh
+new file mode 100644
+index 0000000..c674e05
+--- /dev/null
++++ b/src/sixelparser.hh
+@@ -0,0 +1,75 @@
++/*
++ * Copyright © 2016-2020 Hayaki Saito
++ * Copyright © 2020 Hans Petter Jansson
++ * originally written by kmiya@cluti (https://github.com/saitoha/sixel/blob/master/fromsixel.c)
++ *
++ * This library is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU General Public
++ * License as published by the Free Software Foundation; either
++ * version 3 of the License, or (at your option) any later version.
++ *
++ * This library is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public License
++ * along with this program.  If not, see <https://www.gnu.org/licenses/>.
++ */
++
++#pragma once
++
++#include <stdint.h>
++
++#define DECSIXEL_PARAMS_MAX 16
++#define DECSIXEL_PALETTE_MAX 1024
++#define DECSIXEL_PARAMVALUE_MAX 65535
++#define DECSIXEL_WIDTH_MAX 4096
++#define DECSIXEL_HEIGHT_MAX 4096
++
++typedef unsigned short sixel_color_no_t;
++typedef struct sixel_image_buffer {
++        sixel_color_no_t *data;
++        int width;
++        int height;
++        int palette[DECSIXEL_PALETTE_MAX];
++        sixel_color_no_t ncolors;
++        int palette_modified;
++        int use_private_register;
++} sixel_image_t;
++
++typedef enum parse_state {
++        DECSIXEL_PS_ESC = 1,   /* ESC */
++        DECSIXEL_PS_DECSIXEL,  /* DECSIXEL body part ", $, -, ? ... ~ */
++        DECSIXEL_PS_DECGRA,    /* DECGRA Set Raster Attributes " Pan; Pad; Ph; Pv */
++        DECSIXEL_PS_DECGRI,    /* DECGRI Graphics Repeat Introducer ! Pn Ch */
++        DECSIXEL_PS_DECGCI,    /* DECGCI Graphics Color Introducer # Pc; Pu; Px; Py; Pz */
++} parse_state_t;
++
++typedef struct parser_context {
++        parse_state_t state;
++        int pos_x;
++        int pos_y;
++        int max_x;
++        int max_y;
++
++        /* Pixel aspect ratio; unused */
++        int attributed_pan;
++        int attributed_pad;
++
++        int attributed_ph;
++        int attributed_pv;
++        int repeat_count;
++        int color_index;
++        int bgindex;
++        int param;
++        int nparams;
++        int params[DECSIXEL_PARAMS_MAX];
++        sixel_image_t image;
++} sixel_state_t;
++
++int sixel_parser_init(sixel_state_t *st, int fgcolor, int bgcolor, int use_private_register);
++int sixel_parser_feed(sixel_state_t *st, const uint32_t *p, size_t len);
++int sixel_parser_set_default_color(sixel_state_t *st);
++int sixel_parser_finalize(sixel_state_t *st, unsigned char *pixels);
++void sixel_parser_deinit(sixel_state_t *st);
+diff --git a/src/vte.cc b/src/vte.cc
+index 829e663..f859298 100644
+--- a/src/vte.cc
++++ b/src/vte.cc
+@@ -7637,6 +7637,7 @@ Terminal::vadjustment_value_changed()
+ 	if (!_vte_double_equal(dy, 0)) {
+ 		_vte_debug_print(VTE_DEBUG_ADJ,
+ 			    "Scrolling by %f\n", dy);
++
+                 invalidate_all();
+                 match_contents_clear();
+ 		emit_text_scrolled(dy);
+@@ -7744,6 +7745,11 @@ Terminal::Terminal(vte::platform::Widget* w,
+         save_cursor(&m_normal_screen);
+         save_cursor(&m_alternate_screen);
+ 
++#ifdef WITH_SIXEL
++	/* Initialize SIXEL color register */
++	sixel_parser_set_default_color(&m_sixel_state);
++#endif
++
+ 	/* Matching data. */
+         m_match_span.clear(); // FIXMEchpe unnecessary
+ 	match_hilite_clear(); // FIXMEchpe unnecessary
+@@ -8200,7 +8206,11 @@ Terminal::draw_cells(vte::view::DrawingContext::TextRequest* items,
+         else
+                 rgb_from_index<4, 5, 4>(deco, dc);
+ 
++#ifndef WITH_SIXEL
+         if (clear && (draw_default_bg || back != VTE_DEFAULT_BG)) {
++#else
++        {
++#endif
+                 /* Paint the background. */
+                 i = 0;
+                 while (i < n) {
+@@ -8218,11 +8228,26 @@ Terminal::draw_cells(vte::view::DrawingContext::TextRequest* items,
+                                         break;                                  /* break the run */
+                                 }
+                         }
+-			m_draw.fill_rectangle(
+-                                                 xl,
+-                                                 y,
+-                                                 xr - xl, row_height,
+-                                                 &bg, VTE_DRAW_OPAQUE);
++
++#ifdef WITH_SIXEL
++                        if (back == VTE_DEFAULT_BG) {
++                                /* Clear cells in order to properly overdraw images */
++                                m_draw.clear(xl,
++                                             y,
++                                             xr - xl, row_height,
++                                             get_color(VTE_DEFAULT_BG), m_background_alpha);
++                        }
++
++                        if (clear && (draw_default_bg || back != VTE_DEFAULT_BG)) {
++#else
++                        {
++#endif
++                                m_draw.fill_rectangle(
++                                                      xl,
++                                                      y,
++                                                      xr - xl, row_height,
++                                                      &bg, VTE_DRAW_OPAQUE);
++                        }
+                 }
+         }
+ 
+@@ -8832,15 +8857,18 @@ Terminal::draw_rows(VteScreen *screen_,
+                         nhilite = (nhyperlink && cell->attr.hyperlink_idx == m_hyperlink_hover_idx) ||
+                                   (!nhyperlink && regex_match_has_current() && m_match_span.contains(row, lcol));
+                         if (cell->c == 0 ||
+-                                ((cell->c == ' ' || cell->c == '\t') &&  // FIXME '\t' is newly added now, double check
+-                                 cell->attr.has_none(VTE_ATTR_UNDERLINE_MASK |
+-                                                     VTE_ATTR_STRIKETHROUGH_MASK |
+-                                                     VTE_ATTR_OVERLINE_MASK) &&
+-                                 !nhyperlink &&
+-                                 !nhilite) ||
++#ifndef WITH_SIXEL
++                            ((cell->c == ' ' || cell->c == '\t') &&  // FIXME '\t' is newly added now, double check
++                             cell->attr.has_none(VTE_ATTR_UNDERLINE_MASK |
++                                                 VTE_ATTR_STRIKETHROUGH_MASK |
++                                                 VTE_ATTR_OVERLINE_MASK) &&
++                             !nhyperlink &&
++                             !nhilite) ||
++#endif
+                             cell->attr.fragment() ||
+                             cell->attr.invisible()) {
+-                                /* Skip empty or fragment cell. */
++                                /* Skip empty or fragment cell, but erase on ' ' and '\t', since
++                                 * it may be overwriting an image. */
+                                 lcol++;
+                                 continue;
+                         }
+@@ -9196,6 +9224,9 @@ Terminal::widget_draw(cairo_t *cr)
+         int allocated_width, allocated_height;
+         int extra_area_for_cursor;
+         bool text_blink_enabled_now;
++#ifdef WITH_SIXEL
++        VteRing *ring = m_screen->row_data;
++#endif
+         gint64 now = 0;
+ 
+         if (!gdk_cairo_get_clip_rectangle (cr, &clip_rect))
+@@ -9223,6 +9254,33 @@ Terminal::widget_draw(cairo_t *cr)
+                                  get_color(VTE_DEFAULT_BG), m_background_alpha);
+         }
+ 
++#ifdef WITH_SIXEL
++	/* Draw images */
++	if (m_images_enabled) {
++		vte::grid::row_t top_row = first_displayed_row();
++		vte::grid::row_t bottom_row = last_displayed_row();
++		auto image_map = ring->m_image_priority_map;
++		auto it = image_map->begin ();
++		for (; it != image_map->end (); ++it) {
++			vte::image::Image *image = it->second;
++
++                        if (image->get_bottom() < top_row
++                            || image->get_top() > bottom_row)
++				continue;
++
++			int x = m_padding.left + image->get_left () * m_cell_width;
++			int y = m_padding.top + (image->get_top () - m_screen->scroll_delta) * m_cell_height;
++
++                        /* Clear cell extent; image may be slightly smaller */
++                        m_draw.clear(x, y, image->get_width() * m_cell_width,
++                                     image->get_height() * m_cell_height,
++                                     get_color(VTE_DEFAULT_BG), m_background_alpha);
++
++			image->paint (cr, x, y, m_cell_width, m_cell_height);
++		}
++	}
++#endif /* WITH_SIXEL */
++
+         /* Clip vertically, for the sake of smooth scrolling. We want the top and bottom paddings to be unused.
+          * Don't clip horizontally so that antialiasing can legally overflow to the right padding. */
+         cairo_save(cr);
+@@ -9906,6 +9964,12 @@ Terminal::reset(bool clear_tabstops,
+ 	m_mouse_smooth_scroll_delta = 0.;
+ 	/* Clear modifiers. */
+ 	m_modifiers = 0;
++
++#ifdef WITH_SIXEL
++	/* Reset SIXEL color register */
++	sixel_parser_set_default_color(&m_sixel_state);
++#endif
++
+         /* Reset the saved cursor. */
+         save_cursor(&m_normal_screen);
+         save_cursor(&m_alternate_screen);
+diff --git a/src/vtedefines.hh b/src/vtedefines.hh
+index 8aa4d9d..2de3a62 100644
+--- a/src/vtedefines.hh
++++ b/src/vtedefines.hh
+@@ -143,3 +143,5 @@
+ #define VTE_VERSION_NUMERIC ((VTE_MAJOR_VERSION) * 10000 + (VTE_MINOR_VERSION) * 100 + (VTE_MICRO_VERSION))
+ 
+ #define VTE_TERMINFO_NAME "xterm-256color"
++
++#define VTE_SIXEL_ENABLED_DEFAULT false
+diff --git a/src/vtegtk.cc b/src/vtegtk.cc
+index f4dc5a4..6b2ec44 100644
+--- a/src/vtegtk.cc
++++ b/src/vtegtk.cc
+@@ -1791,7 +1791,11 @@ vte_terminal_class_init(VteTerminalClass *klass)
+          */
+         pspecs[PROP_ENABLE_SIXEL] =
+                 g_param_spec_boolean ("enable-sixel", nullptr, nullptr,
++#ifdef WITH_SIXEL
++                                      VTE_SIXEL_ENABLED_DEFAULT,
++#else
+                                       false,
++#endif
+                                       (GParamFlags) (G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS | G_PARAM_EXPLICIT_NOTIFY));
+ 
+ 
+@@ -2077,6 +2081,11 @@ vte_get_features (void) noexcept
+                 "-ICU"
+ #endif
+                 " "
++#ifdef WITH_SIXEL
++                "+SIXEL"
++#else
++                "-SIXEL"
++#endif
+ #ifdef __linux__
+                 " "
+ #ifdef WITH_SYSTEMD
+@@ -2107,6 +2116,9 @@ vte_get_feature_flags(void) noexcept
+ #ifdef WITH_ICU
+                                VTE_FEATURE_FLAG_ICU |
+ #endif
++#ifdef WITH_SIXEL
++                               VTE_FEATURE_FLAG_SIXEL |
++#endif
+ #ifdef __linux__
+ #ifdef WITH_SYSTEMD
+                                VTE_FEATURE_FLAG_SYSTEMD |
+@@ -5625,7 +5637,7 @@ catch (...)
+  * @terminal: a #VteTerminal
+  * @enabled: whether to enable SIXEL images
+  *
+- * This function does nothing.
++ * Set whether to enable SIXEL images.
+  *
+  * Since: 0.62
+  */
+@@ -5634,6 +5646,12 @@ vte_terminal_set_enable_sixel(VteTerminal *terminal,
+                               gboolean enabled) noexcept
+ try
+ {
++#ifdef WITH_SIXEL
++        g_return_if_fail(VTE_IS_TERMINAL(terminal));
++
++        if (WIDGET(terminal)->set_sixel_enabled(enabled != FALSE))
++                g_object_notify_by_pspec(G_OBJECT(terminal), pspecs[PROP_ENABLE_SIXEL]);
++#endif
+ }
+ catch (...)
+ {
+@@ -5644,7 +5662,7 @@ catch (...)
+  * vte_terminal_get_enable_sixel:
+  * @terminal: a #VteTerminal
+  *
+- * Returns: %FALSE
++ * Returns: %TRUE if SIXEL image support is enabled, %FALSE otherwise
+  *
+  * Since: 0.62
+  */
+@@ -5652,7 +5670,13 @@ gboolean
+ vte_terminal_get_enable_sixel(VteTerminal *terminal) noexcept
+ try
+ {
++#ifdef WITH_SIXEL
++        g_return_val_if_fail(VTE_IS_TERMINAL(terminal), FALSE);
++
++        return WIDGET(terminal)->sixel_enabled();
++#else
+         return false;
++#endif
+ }
+ catch (...)
+ {
+diff --git a/src/vteinternal.hh b/src/vteinternal.hh
+index bc75888..8c51091 100644
+--- a/src/vteinternal.hh
++++ b/src/vteinternal.hh
+@@ -48,6 +48,7 @@
+ 
+ #include "vtepcre2.h"
+ #include "vteregexinternal.hh"
++#include "sixelparser.hh"
+ 
+ #include "chunk.hh"
+ #include "pty.hh"
+@@ -752,6 +753,22 @@ public:
+                                                             this),
+                                                   "mouse-autoscroll-timer"};
+ 
++        /* Inline images */
++        bool m_sixel_enabled{VTE_SIXEL_ENABLED_DEFAULT};
++        bool m_images_enabled{VTE_SIXEL_ENABLED_DEFAULT};
++        sixel_state_t m_sixel_state;
++
++        bool set_sixel_enabled(bool enabled) noexcept
++        {
++                auto const changed = m_sixel_enabled != enabled;
++                m_sixel_enabled = m_images_enabled = enabled;
++                if (changed)
++                        invalidate_all();
++                return changed;
++        }
++
++        constexpr bool sixel_enabled() const noexcept { return m_sixel_enabled; }
++
+ 	/* State variables for handling match checks. */
+         int m_match_regex_next_tag{0};
+         auto regex_match_next_tag() noexcept { return m_match_regex_next_tag++; }
+@@ -1509,6 +1526,7 @@ public:
+         bool set_scrollback_lines(long lines);
+         bool set_scroll_on_keystroke(bool scroll);
+         bool set_scroll_on_output(bool scroll);
++        bool set_images_enabled(bool enabled);
+         bool set_word_char_exceptions(std::optional<std::string_view> stropt);
+         void set_clear_background(bool setting);
+ 
+@@ -1562,7 +1580,8 @@ public:
+         inline vte::grid::column_t get_cursor_column_unclamped() const;
+         inline void move_cursor_up(vte::grid::row_t rows);
+         inline void move_cursor_down(vte::grid::row_t rows);
+-        inline void erase_characters(long count);
++        inline void erase_characters(long count,
++                                     bool use_basic = false);
+         inline void insert_blank_character();
+ 
+         template<unsigned int redbits, unsigned int greenbits, unsigned int bluebits>
+diff --git a/src/vteseq.cc b/src/vteseq.cc
+index ba9a2df..f2d1e52 100644
+--- a/src/vteseq.cc
++++ b/src/vteseq.cc
+@@ -945,7 +945,8 @@ Terminal::move_cursor_down(vte::grid::row_t rows)
+ }
+ 
+ void
+-Terminal::erase_characters(long count)
++Terminal::erase_characters(long count,
++                           bool use_basic)
+ {
+ 	VteCell *cell;
+ 	long col, i;
+@@ -968,10 +969,10 @@ Terminal::erase_characters(long count)
+ 					/* Replace this cell with the current
+ 					 * defaults. */
+ 					cell = _vte_row_data_get_writable (rowdata, col);
+-                                        *cell = m_color_defaults;
++                                        *cell = use_basic ? basic_cell : m_color_defaults;
+ 				} else {
+ 					/* Add new cells until we have one here. */
+-                                        _vte_row_data_fill (rowdata, &m_color_defaults, col + 1);
++                                        _vte_row_data_fill (rowdata, use_basic ? &basic_cell : &m_color_defaults, col + 1);
+ 				}
+ 			}
+ 		}
+@@ -2376,7 +2377,11 @@ Terminal::DA1(vte::parser::Sequence const& seq)
+         if (seq.collect1(0, 0) != 0)
+                 return;
+ 
+-        reply(seq, VTE_REPLY_DECDA1R, {65, 1, 9});
++        reply(seq, VTE_REPLY_DECDA1R, {65, 1,
++#ifdef WITH_SIXEL
++                                       4,
++#endif
++                                       9});
+ }
+ 
+ void
+@@ -4333,6 +4338,105 @@ Terminal::DECSIXEL(vte::parser::Sequence const& seq)
+          *
+          * References: VT330
+          */
++
++#ifdef WITH_SIXEL
++        if (!m_sixel_enabled)
++                return;
++
++	unsigned char *pixels = NULL;
++	auto fg = get_color(VTE_DEFAULT_FG);
++	auto bg = get_color(VTE_DEFAULT_BG);
++	int nfg = (fg->red >> 8) | ((fg->green >> 8) << 8) | ((fg->blue >> 8) << 16);
++	int nbg = (bg->red >> 8) | ((bg->green >> 8) << 8) | ((bg->blue >> 8) << 16);
++	glong left, top, width, height;
++	glong pixelwidth, pixelheight;
++	glong i;
++	cairo_surface_t *image_surface, *surface;
++	cairo_t *cr;
++
++        /* This is unfortunate, but it avoids copying or measuring potentially
++         * megabytes of data */
++        const vte_seq_string_t *arg_str = &((*((vte::parser::Sequence &) seq).seq_ptr())->arg_str);
++
++	/* Parse image */
++
++	if (sixel_parser_init(&m_sixel_state, nfg, nbg,
++                              m_modes_private.XTERM_SIXEL_PRIVATE_COLOR_REGISTERS()) < 0) {
++		sixel_parser_deinit(&m_sixel_state);
++		return;
++	}
++	if (sixel_parser_feed(&m_sixel_state, arg_str->buf, arg_str->len) < 0) {
++		sixel_parser_deinit(&m_sixel_state);
++		return;
++	}
++	pixels = (unsigned char *)g_try_malloc(m_sixel_state.image.width * m_sixel_state.image.height * 4);
++	if (!pixels) {
++		sixel_parser_deinit(&m_sixel_state);
++		return;
++	}
++	if (sixel_parser_finalize(&m_sixel_state, pixels) < 0) {
++                g_free(pixels);
++		sixel_parser_deinit(&m_sixel_state);
++		return;
++	}
++	sixel_parser_deinit(&m_sixel_state);
++
++	/* Calculate geometry */
++
++	left = m_screen->cursor.col;
++	top = m_screen->cursor.row;
++	width = (m_sixel_state.image.width + m_cell_width - 1) / m_cell_width;
++	height = (m_sixel_state.image.height + m_cell_height - 1) / m_cell_height;
++	pixelwidth = m_sixel_state.image.width;
++	pixelheight = m_sixel_state.image.height;
++
++	/* Convert to device-compatible surface for m_widget */
++
++	image_surface = cairo_image_surface_create_for_data(pixels, CAIRO_FORMAT_ARGB32, pixelwidth, pixelheight, pixelwidth * 4);
++        if (!image_surface) {
++                g_free(pixels);
++                return;
++        }
++
++	surface = gdk_window_create_similar_surface(gtk_widget_get_window (m_widget), CAIRO_CONTENT_COLOR_ALPHA, pixelwidth, pixelheight);
++        if (!surface) {
++                cairo_surface_destroy(image_surface);
++                g_free(pixels);
++                return;
++        }
++
++	cr = cairo_create(surface);
++	cairo_set_source_surface(cr, image_surface, 0, 0);
++	cairo_paint(cr);
++	cairo_destroy(cr);
++	cairo_surface_destroy(image_surface);
++	g_free(pixels);
++
++	/* Append image to Ring */
++
++	m_screen->row_data->append_image(surface, pixelwidth, pixelheight, left, top, m_cell_width, m_cell_height);
++
++	/* Erase characters under the image */
++
++	for (i = 0; i < height; ++i) {
++                vte::grid::row_t row = top + i;
++
++		erase_characters(width, true);
++
++                if (row > m_screen->insert_delta - 1
++                    && row < m_screen->insert_delta + m_row_count)
++                        set_hard_wrapped(row);
++
++		if (i == height - 1) {
++			if (m_modes_private.MINTTY_SIXEL_SCROLL_CURSOR_RIGHT())
++				move_cursor_forward(width);
++			else
++				cursor_down(true);
++		} else {
++			cursor_down(true);
++		}
++	}
++#endif /* WITH_SIXEL */
+ }
+ 
+ void
+@@ -5386,7 +5490,7 @@ Terminal::ECH(vte::parser::Sequence const& seq)
+ 
+         // FIXMEchpe limit to column_count - cursor.x ?
+         auto const count = seq.collect1(0, 1, 1, int(65535));
+-        erase_characters(count);
++        erase_characters(count, false);
+ }
+ 
+ void
+diff --git a/src/widget.hh b/src/widget.hh
+index 0025d5b..d870135 100644
+--- a/src/widget.hh
++++ b/src/widget.hh
+@@ -177,6 +177,9 @@ public:
+ 
+         bool should_emit_signal(int id) noexcept;
+ 
++        bool set_sixel_enabled(bool enabled) noexcept { return m_terminal->set_sixel_enabled(enabled); }
++        bool sixel_enabled() const noexcept { return m_terminal->sixel_enabled(); }
++
+ protected:
+ 
+         enum class CursorType {
